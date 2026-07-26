@@ -1,0 +1,354 @@
+# ==============================================================================
+# MetaBayes — Bayesian Meta-Analysis + LOO | Google Sheets Automation
+# Continuous Outcome ONLY (Mean Monthly Migraine Days - MMD)
+# Phase 1: Primary Analysis + Sensitivity Analyses
+# Phase 2: Leave-One-Out (LOO) — controle manual via loo_config
+# ==============================================================================
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# §0 — CONFIGURAÇÃO
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# >>> AJUSTE SEUS CAMINHOS AQUI <<<
+url        <- "https://docs.google.com/spreadsheets/d/1m0gkKISAjq8gnfHZ0Rj2EuiAFqXlGFbr742BwVsYL2U/edit?gid=567117787#gid=567117787"
+output_dir <- "/Users/davibarbosa/Library/CloudStorage/GoogleDrive-davibarbosaps@gmail.com/.shortcut-targets-by-id/1fo5IjHiV5-ySXITDdP_pv7EElS6VuYcV/META Fremanezumab/Estatística" # Ajuste para a pasta correta
+
+# ── Phase 2 — LOO (TRUE = executar / FALSE = não executar) ──────────────────
+loo_config <- c(
+  # Exemplo: "Mean monthly migraine days, baseline to week 12 CM" = TRUE
+)
+
+# ── Inversão de rótulos do forest (TRUE = inverter label.left ↔ label.right) ─
+invert_labels_config <- c(
+  # Exemplo: "Mean monthly migraine days, baseline to week 12 CM" = TRUE
+)
+
+# ── Priors: MMD (Mean Difference) ───────────────────────────────────────────
+prior_mu_vague_mean_MD <- 0
+prior_mu_vague_sd_MD   <- 510
+
+# Priors Baseados no Comportamento Clínico do MMD
+extreme_tau_MD     <- 10 # Diferença extrema de 10 dias para a heterogeneidade
+vague_tau_MD_scale <- 4  # Escala 4 para sensibilidade (regra fixa diretriz)
+extreme_mu_MD      <- 20 # Diferença extrema de 20 dias para efeito global
+
+# Eixo X dos gráficos de probabilidade (Adaptado para MMD)
+md_x_range <- c(-10, 5)
+md_x_by    <- 2
+md_x_label <- "Mean Difference (MMD)"
+
+# Rótulos do Forest Plot
+label_e_MD     <- "Monthly" # Ajuste conforme necessário
+label_c_MD     <- "Quarterly"      # Ajuste conforme necessário
+label_left_MD  <- "Favors monthly"
+label_right_MD <- "Favors quarterly"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# §1 — PACOTES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if (!require("devtools")) install.packages("devtools")
+if (!require("pacman"))   install.packages("pacman")
+if (!requireNamespace("BayesianPriorsTool", quietly = TRUE))
+  devtools::install_github("arthur-albuquerque/BayesianPriorsTool")
+
+pacman::p_load(
+  googlesheets4, ragg, officer, bayesmeta, BayesianPriorsTool, 
+  dplyr, tidyr, metafor, ggdist, ggplot2, patchwork, meta, 
+  janitor, future, future.apply
+)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# §2 — AUTENTICAÇÃO E TEMA
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Desautenticação para ler planilhas públicas (Qualquer pessoa com o link) sem login
+gs4_deauth()
+
+theme_set(
+  theme(
+    plot.title.position = "plot",
+    axis.ticks.x        = element_blank(),
+    axis.ticks.y        = element_blank(),
+    axis.text.x         = element_text(size = 12),
+    axis.text.y         = element_text(size = 12),
+    axis.title.x        = element_text(size = 14),
+    panel.background    = element_blank(),
+    panel.grid.major.x  = element_line(color = "gray80", linewidth = 0.3)
+  )
+)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# §3 — FUNÇÕES AUXILIARES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+log_error <- function(context, error_msg) {
+  log_path <- file.path(output_dir, "pipeline_errors.log")
+  write(paste0("[", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "] ", context, " — ", error_msg),
+        file = log_path, append = TRUE)
+}
+
+save_plot <- function(filename_base, plot_fn, out_dir, width = 16, height = 10) {
+  agg_tiff(file.path(out_dir, paste0(filename_base, ".tiff")), width = width, height = height, units = "in", res = 300, compression = "lzw")
+  plot_fn(); dev.off()
+  agg_png(file.path(out_dir, paste0(filename_base, ".png")), width = width, height = height, units = "in", res = 300)
+  plot_fn(); dev.off()
+}
+
+save_docx <- function(filename_base, lines, out_dir) {
+  prop <- officer::fp_text(font.family = "Courier New", font.size = 10)
+  doc  <- officer::read_docx()
+  for (line in lines) doc <- officer::body_add_fpar(doc, officer::fpar(officer::ftext(as.character(line), prop)))
+  print(doc, target = file.path(out_dir, paste0(filename_base, ".docx")))
+}
+
+get_summary <- function(model) {
+  list(
+    mu_mean     = model$summary["mean",      "mu"],
+    mu_upper    = model$summary["95% upper", "mu"],
+    mu_lower    = model$summary["95% lower", "mu"],
+    tau_median  = model$summary["median",    "tau"],
+    tau_upper   = model$summary["95% upper", "tau"],
+    tau_lower   = model$summary["95% lower", "tau"],
+    theta_mean  = model$summary["mean",      "theta"],
+    theta_upper = model$summary["95% upper", "theta"],
+    theta_lower = model$summary["95% lower", "theta"]
+  )
+}
+
+should_run_loo <- function(sheet) isTRUE(loo_config[sheet])
+
+get_forest_labels <- function(sheet, left, right) {
+  if (isTRUE(invert_labels_config[sheet])) list(left = right, right = left)
+  else list(left = left,  right = right)
+}
+
+generate_posterior_plots_md <- function(model, fill_color, is_predict = FALSE, x_range = md_x_range, x_by = md_x_by, x_lab = md_x_label) {
+  set.seed(123)
+  samples    <- model$rposterior(n = 10000, tau.sample = FALSE, predict = is_predict)
+  df_s       <- data.frame(samples = samples)
+  cutoff_seq <- seq(x_range[1], x_range[2], by = 1)
+  
+  p_dens <- ggplot(df_s, aes(x = samples)) +
+    ggdist::stat_halfeye(.width = 0.95, point_interval = "mean_hdi", fill = fill_color) +
+    labs(x = paste0("\n", x_lab), y = "Density") +
+    theme(axis.text.y = element_blank())
+  
+  probs <- if (is_predict) model$pposterior(theta = cutoff_seq, predict = TRUE) else model$pposterior(mu = cutoff_seq)
+  p_prob <- ggplot(data.frame(cutoffs = cutoff_seq, probs = probs), aes(x = cutoffs, y = probs)) +
+    geom_line() +
+    scale_x_continuous(breaks = seq(x_range[1], x_range[2], by = x_by)) +
+    scale_y_continuous(breaks = seq(0, 1, by = 0.2)) +
+    labs(x = paste0("\n", x_lab), y = expression("Probability MD" <= "X")) +
+    theme(panel.grid.major.y = element_line(color = "gray80", linewidth = 0.3))
+  
+  list(density = p_dens, probability = p_prob)
+}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# §4 — FASE 2: Leave-One-Out (LOO) 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+run_loo_analysis <- function(dat, full_model, mu_mean, mu_sd, tau_prior_func, label_col, out_dir, sheet_name) {
+  K      <- nrow(dat)
+  eff_lb <- "MD"
+  
+  plan(multisession)
+  on.exit(plan(sequential), add = TRUE)
+  
+  loo_list <- future_lapply(seq_len(K), function(i) {
+    dat_loo <- dat[-i, ]
+    fit     <- bayesmeta(y = dat_loo$yi, sigma = dat_loo$sei, labels = dat_loo[[label_col]],
+                         mu.prior.mean = mu_mean, mu.prior.sd = mu_sd, tau.prior = tau_prior_func)
+    list(study_excluded = dat[[label_col]][i], estimate = fit$summary["median", "mu"],
+         ci_lower = fit$summary["95% lower", "mu"], ci_upper = fit$summary["95% upper", "mu"],
+         tau_median = fit$summary["median", "tau"])
+  }, future.seed = TRUE)
+  
+  loo_res <- data.frame(
+    study_excluded = sapply(loo_list, `[[`, "study_excluded"), estimate = sapply(loo_list, `[[`, "estimate"),
+    ci_lower = sapply(loo_list, `[[`, "ci_lower"), ci_upper = sapply(loo_list, `[[`, "ci_upper"),
+    tau_median = sapply(loo_list, `[[`, "tau_median"), stringsAsFactors = FALSE
+  )
+  
+  full_mu    <- full_model$summary["median", "mu"]
+  full_mu_lo <- full_model$summary["95% lower", "mu"]
+  full_mu_hi <- full_model$summary["95% upper", "mu"]
+  
+  m_ref <- metagen(sm = "MD", TE = c(loo_res$estimate, full_mu), lower = c(loo_res$ci_lower, full_mu_lo),
+                   upper = c(loo_res$ci_upper, full_mu_hi), studlab = c(paste0("Omitting: ", loo_res$study_excluded), "Full Analysis (Reference)"),
+                   random = FALSE, fixed = FALSE)
+  
+  sq_col <- c(rep("steelblue", K), "firebrick")
+  loo_h  <- max(10, (K + 1) * 0.45 + 5)
+  
+  save_plot("Supp_Fig_5_LOO_Forest", function() {
+    meta::forest(m_ref, leftcols = "studlab", leftlabs = "Study", rightcols = c("effect", "ci"),
+                 rightlabs = c(eff_lb, "95% CrI"), xlab = "Mean Difference (MMD)", smlab = "", weight.study = "same",
+                 col.square = sq_col, col.square.lines = sq_col, overall = FALSE, print.tau2 = FALSE, print.I2 = FALSE,
+                 print.pval.Q = FALSE, hetstat = FALSE, overall.hetstat = FALSE)
+  }, out_dir, height = loo_h)
+  
+  fmt <- function(e, lo, hi) sprintf("%6.2f [%6.2f, %6.2f]", e, lo, hi)
+  hdr <- sprintf("%-32s | %-22s | %s", "Study Excluded", paste0(eff_lb, " [95% CrI]"), "tau (median)")
+  rows <- vapply(seq_len(nrow(loo_res)), function(i) {
+    r <- loo_res[i, ]
+    sprintf("%-32s | %-22s | %.3f", r$study_excluded, fmt(r$estimate, r$ci_lower, r$ci_upper), r$tau_median)
+  }, character(1))
+  ref_row <- sprintf("%-32s | %-22s | %s", "Full Analysis (Reference)", fmt(full_mu, full_mu_lo, full_mu_hi), "—")
+  
+  save_docx("Supp_Table_2_LOO_Results", c(
+    paste0("LOO Sensitivity Analysis: ", sheet_name), paste(rep("-", 72), collapse = ""), hdr,
+    paste(rep("-", 72), collapse = ""), rows, paste(rep("-", 72), collapse = ""), ref_row
+  ), out_dir)
+}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# §5 — ANÁLISE PRINCIPAL (Mean Difference - MMD)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+run_bayesian_meta <- function(sheet, base_dir = output_dir) {
+  
+  dat <- tryCatch({ as.data.frame(read_sheet(url, sheet = sheet)) |> janitor::clean_names() }, 
+                  error = function(e) { log_error(paste0("read_sheet — ", sheet), e$message); NULL })
+  if (is.null(dat)) return(invisible(NULL))
+  
+  out_dir_main <- file.path(base_dir, sheet)
+  out_dir_meth <- file.path(out_dir_main, "Supplementary_Methods")
+  out_dir_resu <- file.path(out_dir_main, "Supplementary_Results")
+  dir.create(out_dir_meth, showWarnings = FALSE, recursive = TRUE)
+  dir.create(out_dir_resu, showWarnings = FALSE, recursive = TRUE)
+  
+  # ── Dados ───────────────────────────────────────────────────────────────────
+  # Padroniza a coluna de identificação (study ou source)
+  label_col <- if("source" %in% names(dat)) "source" else "study"
+  dat       <- dat[!is.na(dat[[label_col]]), ]
+  
+  dat_MD <- escalc(measure = "MD", m1i = m1i, sd1i = sd1i, n1i = n1i, m2i = m2i, sd2i = sd2i, n2i = n2i, data = dat) |> data.frame()
+  dat_MD$sei <- sqrt(dat_MD$vi)
+  
+  if (nrow(dat_MD) < 2) stop("Menos de 2 estudos validos em '", sheet, "'.")
+  
+  # ── Priors Construídos via Função ──────────────────────────────────────────
+  scale_tau_prim <- tau_prior_scale(extreme_tau_MD)
+  sd_mu_sens     <- mu_prior_sd(extreme_mu_MD)
+  
+  prior_tau_weakly_func <- function(x) dhalfnormal(x, scale = scale_tau_prim)
+  prior_tau_vague_func  <- function(x) dhalfnormal(x, scale = vague_tau_MD_scale)
+  
+  plot_mu_primary_prior  <- mu_dist_viz(mean = prior_mu_vague_mean_MD, sd = prior_mu_vague_sd_MD, scale = "absolute", xlabel = md_x_label)
+  plot_tau_primary_prior <- tau_prior_plot(extreme_tau_MD)
+  plot_mu_sens_prior     <- mu_dist_viz(mean = 0, sd = sd_mu_sens, scale = "absolute", xlabel = md_x_label)
+  plot_tau_vague_prior   <- tau_dist_viz(dist = "half-normal", scale = vague_tau_MD_scale)
+  
+  # ── Modelos ──────────────────────────────────────────────────────────────────
+  meta_MD_primary <- bayesmeta(y = dat_MD$yi, sigma = dat_MD$sei, labels = dat_MD[[label_col]],
+                               mu.prior.mean = prior_mu_vague_mean_MD, mu.prior.sd = prior_mu_vague_sd_MD, tau.prior = prior_tau_weakly_func)
+  meta_MD_sens    <- bayesmeta(y = dat_MD$yi, sigma = dat_MD$sei, labels = dat_MD[[label_col]],
+                               mu.prior.mean = 0, mu.prior.sd = sd_mu_sens, tau.prior = prior_tau_vague_func)
+  
+  post_prim <- get_summary(meta_MD_primary)
+  post_sens <- get_summary(meta_MD_sens)
+  
+  # ── Forest base ──────────────────────────────────────────────────────────────
+  forest_data_MD <- metacont(data = dat_MD, studlab = dat_MD[[label_col]],
+                             mean.e = m1i, sd.e = sd1i, n.e = n1i, mean.c = m2i, sd.c = sd2i, n.c = n2i,
+                             sm = "MD", common = FALSE, random = FALSE)
+  
+  mf_prim      <- metaadd(forest_data_MD, type = "random", TE = post_prim$mu_mean, upper = post_prim$mu_upper, lower = post_prim$mu_lower)
+  mf_prim_pred <- metaadd(mf_prim, type = "prediction", TE = post_prim$theta_mean, upper = post_prim$theta_upper, lower = post_prim$theta_lower)
+  mf_sens      <- metaadd(forest_data_MD, type = "random", TE = post_sens$mu_mean, upper = post_sens$mu_upper, lower = post_sens$mu_lower)
+  mf_sens_pred <- metaadd(forest_data_MD, type = "prediction", TE = post_sens$theta_mean, upper = post_sens$theta_upper, lower = post_sens$theta_lower)
+  
+  analyses_names <- c("Primary: Vague Mu / Weakly-Informative Tau", "Sensitivity: Weakly-Informative Mu / Vague Tau")
+  all_overall <- metabind(mf_prim,      mf_sens,      name = analyses_names)
+  all_predict <- metabind(mf_prim_pred, mf_sens_pred, name = analyses_names)
+  
+  tau_fmt <- function(p) paste0("τ = ", round(p$tau_median, 2), " [95% CrI ", round(p$tau_lower, 2), ", ", round(p$tau_upper, 2), "]")
+  tau_prim_text <- tau_fmt(post_prim)
+  tau_sens_text <- tau_fmt(post_sens)
+  
+  plots_prim <- generate_posterior_plots_md(meta_MD_primary, "skyblue")
+  plots_pred <- generate_posterior_plots_md(meta_MD_primary, "firebrick", is_predict = TRUE)
+  
+  p_mu_le0    <- round(meta_MD_primary$pposterior(mu    = 0)                      * 100, 2)
+  p_mu_gt0    <- round((1 - meta_MD_primary$pposterior(mu    = 0))                * 100, 2)
+  p_theta_le0 <- round(meta_MD_primary$pposterior(theta = 0, predict = TRUE)      * 100, 2)
+  p_theta_gt0 <- round((1 - meta_MD_primary$pposterior(theta = 0, predict = TRUE)) * 100, 2)
+  
+  n_studies     <- nrow(dat_MD)
+  forest_height <- max(10, n_studies * 0.4 + 5)
+  sens_height   <- max(8,  2 * 0.6 + 4)
+  lbl           <- get_forest_labels(sheet, label_left_MD, label_right_MD)
+  
+  # ── Exportações — Fase 1 ──────────────────────────────────────────────────
+  save_plot("Figure_1_Forest_Primary", function() {
+    meta::forest(mf_prim_pred, layout = "RevMan5", sortvar = dat_MD[[label_col]], text.random = "Bayesian Summary",
+                 text.predict = "Bayesian 95% Prediction Interval", text.addline1 = tau_prim_text, smlab = "Mean Difference (MMD)",
+                 digits.mean = 2, digits.sd = 2, leftcols = c("studlab","mean.e","sd.e","n.e","mean.c","sd.c","n.c","effect.ci"),
+                 leftlabs = c("Study", NA, NA, NA, NA, NA, NA, "MD"), pooled.events = TRUE,
+                 label.e = label_e_MD, label.c = label_c_MD, label.left = lbl$left, label.right = lbl$right, colgap = "6mm")
+  }, out_dir_main, height = forest_height)
+  
+  save_plot("Figure_2_Posterior_Dist", function() { print(plots_prim$density + plots_prim$probability) }, out_dir_main)
+  
+  save_docx("Posterior_Probabilities", c(
+    paste0("Outcome: ", sheet), paste(rep("=", 60), collapse = ""), "",
+    "Primary Analysis — Posterior Probabilities", paste(rep("-", 50), collapse = ""),
+    paste0("P(MD <= 0): ", p_mu_le0,    "%"), paste0("P(MD >  0): ", p_mu_gt0,    "%"),
+    paste0("P(theta <= 0) [predictive]: ", p_theta_le0, "%"), paste0("P(theta >  0) [predictive]: ", p_theta_gt0, "%")
+  ), out_dir_main)
+  
+  save_docx("Model_Summaries", c(
+    paste0("Outcome: ", sheet), paste(rep("=", 60), collapse = ""), "",
+    paste0("=== Primary: Vague Mu / Weakly Tau [extreme_diff=", extreme_tau_MD, "] ==="),
+    capture.output(print(meta_MD_primary$summary)), "",
+    paste0("=== Sensitivity: Weakly Mu [extreme_diff=", extreme_mu_MD, "] / Vague Tau [Half-Normal(", vague_tau_MD_scale, ")] ==="),
+    capture.output(print(meta_MD_sens$summary))
+  ), out_dir_main)
+  
+  save_plot("01_Primary_Priors", function() { print(plot_mu_primary_prior / plot_tau_primary_prior) }, out_dir_meth, height = 12)
+  save_plot("02_Sensitivity_Priors", function() { print(plot_mu_sens_prior / plot_tau_vague_prior) }, out_dir_meth, height = 12)
+  save_plot("Supp_Fig_1_Posterior_Predictive", function() { print(plots_pred$density + plots_pred$probability) }, out_dir_resu)
+  save_plot("Supp_Fig_2_Sens_Overall_Effect", function() { meta::forest(all_overall, smlab = "Overall Effect (MD)", leftcols = "studlab") }, out_dir_resu, height = sens_height)
+  save_plot("Supp_Fig_3_Sens_Predictive", function() { meta::forest(all_predict, smlab = "95% Prediction Interval", leftcols = "studlab") }, out_dir_resu, height = sens_height)
+  
+  save_docx("Supp_Table_1_Heterogeneity", c(
+    paste0("Outcome: ", sheet), "Supplementary Table 1 — Between-Study Heterogeneity", paste(rep("-", 80), collapse = ""),
+    paste0("Primary (Vague Mu / Weakly Tau):     ", tau_prim_text), paste0("Sensitivity (Weakly Mu / Vague Tau): ", tau_sens_text)
+  ), out_dir_resu)
+  
+  # ── Fase 2 — LOO manual ──────────────────────────────────────────────────────
+  if (should_run_loo(sheet)) {
+    tryCatch(
+      run_loo_analysis(dat = dat_MD, full_model = meta_MD_primary, mu_mean = prior_mu_vague_mean_MD, mu_sd = prior_mu_vague_sd_MD,
+                       tau_prior_func = prior_tau_weakly_func, label_col = label_col, out_dir = out_dir_resu, sheet_name = sheet),
+      error = function(e) log_error(paste0("LOO — ", sheet), e$message)
+    )
+  }
+  invisible(NULL)
+}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# §6 — EXECUTAR
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Executa SOMENTE as abas nomeadas abaixo:
+all_sheets <- c(
+  "Mean monthly migraine days, baseline to week 12 CM",
+  "Mean monthly migraine days, baseline to week 12 EM"
+)
+
+for (aba in all_sheets) {
+  tryCatch(
+    run_bayesian_meta(aba),
+    error = function(e) log_error(aba, e$message)
+  )
+}
