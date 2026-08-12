@@ -2,13 +2,22 @@ if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
 pacman::p_load(meta, dmetar, googlesheets4, ragg, officer, ggplot2, ggrepel)
 
 # ── Setup ──────────────────────────────────────────────────────────────────────
-url        <- "https://docs.google.com/spreadsheets/d/1tngLZ2f5fGQswfcoOmDh5eekYiGLK74Q3mFdMc4hrIc/edit?gid=1438059454#gid=1438059454"
+url        <- "https://docs.google.com/spreadsheets/d/1PEYMRaguTvPBNtX5vBW9Zh0wIP0abIpalwikFCqoOtw/edit?gid=1445029508#gid=1445029508"
 output_dir <- "/Users/davibarbosa/Desktop/Heitor"
 
-gs4_auth()
+# Desativa a autenticação para ler links públicos sem pedir login
+gs4_deauth()
 
-cat("Available sheets:\n")
-print(sheet_names(url))
+# Define apenas as abas específicas que você quer rodar
+all_sheets <- c(
+  "Δbaseline Post-treatment LH - PP", 
+  "Δbaseline Post-treatment LH - ITT", 
+  "Δbaseline Post-treatment prolactin- PP", 
+  "Δbaseline Post-treatment prolactin- ITT"
+)
+
+cat("Abas selecionadas para análise:\n")
+print(all_sheets)
 
 # ── Visual theme ───────────────────────────────────────────────────────────────
 .theme <- list(
@@ -349,7 +358,6 @@ run_loo_binary <- function(sheet, base_dir = output_dir) {
 # Sheet classification
 # ══════════════════════════════════════════════════════════════════════════════
 
-all_sheets  <- sheet_names(url)
 cont_sheets <- c()
 bin_sheets  <- c()
 
