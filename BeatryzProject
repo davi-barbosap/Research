@@ -1,48 +1,157 @@
 # ==============================================================================
-# MetaBayes — Bayesian Meta-Analysis + LOO | Google Sheets Automation
-# Continuous Outcome ONLY (Mean Monthly Migraine Days - MMD)
-# Phase 1: Primary Analysis + Sensitivity Analyses
-# Phase 2: Leave-One-Out (LOO) — controle manual via loo_config
+# MetaBayes — Bayesian Meta-Analysis por DESFECHO (registro) | Google Sheets
+# Contínuos (MD): MMD 4w/12w, HIT-6, MIDAS
+# Binários  (RR): Responder Rates >=50%, Adverse effects
+# Cada aba: Primary + Sensitivity(mu) + Heterogeneity ladder
+#           (Common-Effect / Restricted / Weakly=PRIMARY / Vague) + ROPE + LOO(opt)
+#
+# >>> ATENÇÃO <<< Este arquivo NÃO foi executado aqui.
+# Priors seguem a TABELA DO ARTHUR:
+#   - MD (absoluto): mu vago N(0,510^2), tau vago HN(4); weakly via Prior Building Tool.
+#   - RR (relativo/OR): mu vago N(0,2.7^2), mu weakly N(0,0.82^2), tau weakly HN(0.5),
+#     tau vago HN(1.5). Informative de tau NÃO usado em RR (só validado p/ OR).
+# Restam A CONFIRMAR só as "diferenças extremas" (extreme_tau/extreme_mu) de HIT-6 e
+# MIDAS, que alimentam o weakly via tool. Restricted-tau + Common-Effect = camada de
+# "piso" pedida à parte (não está na tabela de priors).
+# Rode primeiro UMA aba (outcomes_to_run <- c("mmd_12w")) antes de gerar tudo.
 # ==============================================================================
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# §0 — CONFIGURAÇÃO
+# §0 — CONFIGURAÇÃO GLOBAL
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# >>> AJUSTE SEUS CAMINHOS AQUI <<<
-url        <- "https://docs.google.com/spreadsheets/d/1m0gkKISAjq8gnfHZ0Rj2EuiAFqXlGFbr742BwVsYL2U/edit?gid=567117787#gid=567117787"
-output_dir <- "/Users/davibarbosa/Library/CloudStorage/GoogleDrive-davibarbosaps@gmail.com/.shortcut-targets-by-id/1fo5IjHiV5-ySXITDdP_pv7EElS6VuYcV/META Fremanezumab/Estatística" # Ajuste para a pasta correta
+# Workbook "Stats - Davi" (limpo). Padrão de aba: "<desfecho> / <janela>[ - EM| - CM]".
+url        <- "https://docs.google.com/spreadsheets/d/1POa3MXDqlZe0CUZJIfrwDYM9KXcF3vmzoR2jnsQFRnM/edit?gid=1616647044#gid=1616647044"
+output_dir <- "/Users/davibarbosa/Desktop/Leite" # Ajuste
 
-# ── Phase 2 — LOO (TRUE = executar / FALSE = não executar) ──────────────────
+# LOO por aba (TRUE = executar). Chave = nome EXATO da aba.
 loo_config <- c(
-  # Exemplo: "Mean monthly migraine days, baseline to week 12 CM" = TRUE
+  # "Mean monthly migraine days / 12w - CM" = TRUE
 )
 
-# ── Inversão de rótulos do forest (TRUE = inverter label.left ↔ label.right) ─
+# Inversão de rótulos do forest por aba (TRUE = inverter label.left <-> label.right)
 invert_labels_config <- c(
-  # Exemplo: "Mean monthly migraine days, baseline to week 12 CM" = TRUE
 )
 
-# ── Priors: MMD (Mean Difference) ───────────────────────────────────────────
-prior_mu_vague_mean_MD <- 0
-prior_mu_vague_sd_MD   <- 510
+# Rótulos comuns (comparação: Monthly vs Quarterly)
+label_e_common     <- "Monthly"
+label_c_common     <- "Quarterly"
+label_left_common  <- "Favors monthly"
+label_right_common <- "Favors quarterly"
 
-# Priors Baseados no Comportamento Clínico do MMD
-extreme_tau_MD     <- 10 # Diferença extrema de 10 dias para a heterogeneidade
-vague_tau_MD_scale <- 4  # Escala 4 para sensibilidade (regra fixa diretriz)
-extreme_mu_MD      <- 20 # Diferença extrema de 20 dias para efeito global
 
-# Eixo X dos gráficos de probabilidade (Adaptado para MMD)
-md_x_range <- c(-10, 5)
-md_x_by    <- 2
-md_x_label <- "Mean Difference (MMD)"
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# §0.1 — REGISTRO DE DESFECHOS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Campos por desfecho:
+#   base        : nome-base da aba (sem sufixo de subgrupo)
+#   subgroups   : sufixos existentes ("" = agrupado; " - CM"; " - EM")
+#   scale       : "MD" (contínuo) | "RR" (binário)
+#   link        : "identity" (MD) | "log" (RR)  -> escala do modelo bayesmeta
+#   sm          : "MD" | "RR"                    -> summary measure p/ meta::forest
+#   eff_lab     : rótulo curto do efeito
+#   x_range/by  : eixo dos gráficos de probabilidade, NA ESCALA DO MODELO
+#                 (RR: em log! ex.: log(0.5)..log(2))
+#   x_label     : rótulo do eixo
+#   ROPE (na ESCALA DE REPORTE — MD: dias; RR: risco relativo):
+#     rope_primary/rope_sensitivity : c(lo, hi) ou NULL (NULL = não reportar)
+#   Priors:
+#     mu_vague_mean/sd   : prior vago de mu (na escala do modelo)
+#     extreme_tau        : (MD) diferença extrema p/ derivar HN weakly via tau_prior_scale()
+#     tau_weakly_scale   : (RR) escala HN do weakly, direta
+#     tau_restricted_scale, tau_vague_scale : escalas HN restrita e vaga
+#     extreme_mu         : (MD) p/ mu_prior_sd() do modelo de sensibilidade de mu
+#     mu_sens_sd         : (RR) sd direto do mu de sensibilidade
 
-# Rótulos do Forest Plot
-label_e_MD     <- "Monthly" # Ajuste conforme necessário
-label_c_MD     <- "Quarterly"      # Ajuste conforme necessário
-label_left_MD  <- "Favors monthly"
-label_right_MD <- "Favors quarterly"
+outcome_registry <- list(
+  
+  # ── MMD 4 semanas (MD) — priors iguais aos definidos p/ MMD ────────────────
+  mmd_4w = list(
+    base = "Mean monthly migraine days / 4w", subgroups = c("", " - CM", " - EM"),
+    scale = "MD", link = "identity", sm = "MD", eff_lab = "MD",
+    x_range = c(-10, 5), x_by = 2, x_label = "Mean Difference (MMD)",
+    # ROPE ancorada na EVIDENCIA (6 RCTs). Menor reducao placebo-ajustada de MMD (migraine days)
+    # = ~1.3 dia (Dodick/HALO EM dose unica -1.3; monthly -1.5). Outros EM: Sakai2021b -3.0;
+    # FOCUS -3.1/-3.5. (CM medem 'headache days': HALO CM ~-1.8; Sakai2021a -1.7.)
+    # +/-1.0 = ~2/3 do efeito EM tipico (~1.5); regra ESTRITA (2/3 do minimo 1.3) daria ~0.9.
+    # +/-0.5 = sensibilidade. CAVEAT: EM=migraine days, CM=headache days(mod+). Belskaya: sem placebo.
+    rope_primary = c(-1.0, 1.0), rope_sensitivity = c(-0.5, 0.5),
+    mu_vague_mean = 0, mu_vague_sd = 510,
+    extreme_tau = 10, tau_restricted_scale = 0.125, tau_vague_scale = 4, extreme_mu = 20
+  ),
+  
+  # ── MMD 12 semanas (MD) — PRIMÁRIO do estudo ───────────────────────────────
+  mmd_12w = list(
+    base = "Mean monthly migraine days / 12w", subgroups = c("", " - CM", " - EM"),
+    scale = "MD", link = "identity", sm = "MD", eff_lab = "MD",
+    x_range = c(-10, 5), x_by = 2, x_label = "Mean Difference (MMD)",
+    # ROPE ancorada na evidencia (ver derivacao em mmd_4w): +/-1.0 ~ 2/3 do menor efeito
+    # placebo-ajustado (~1.7 dia, Sakai/HALO CM); +/-0.5 ~ 1/3. Confirmar metrica por ensaio.
+    rope_primary = c(-1.0, 1.0), rope_sensitivity = c(-0.5, 0.5),
+    mu_vague_mean = 0, mu_vague_sd = 510,
+    extreme_tau = 10, tau_restricted_scale = 0.125, tau_vague_scale = 4, extreme_mu = 20
+  ),
+  
+  # ── HIT-6 (MD, pontos 36–78) — sem subgrupo EM ─────────────────────────────
+  hit6 = list(
+    base = "HIT-6 Score / 12w", subgroups = c("", " - CM"),
+    scale = "MD", link = "identity", sm = "MD", eff_lab = "MD",
+    x_range = c(-8, 4), x_by = 2, x_label = "Mean Difference (HIT-6)",
+    # ROPE entre-grupos: 2.5 = limite inferior IHS (Diener) ~ Coeytaux between-group 2.3
+    rope_primary = c(-2.5, 2.5), rope_sensitivity = c(-5.0, 5.0),
+    # Vago fixo p/ MD absoluto (tabela Arthur): mu N(0,510^2), tau HN(4). Weakly via tool.
+    mu_vague_mean = 0, mu_vague_sd = 510,
+    extreme_tau = 10, tau_restricted_scale = 0.30, tau_vague_scale = 4, extreme_mu = 20  # extremos: >>> CONFIRMAR <<<
+  ),
+  
+  # ── MIDAS (MD, 0–270, assimétrico) — sem subgrupo CM; ROPE NÃO reportada ────
+  midas = list(
+    base = "MIDAS / 12w", subgroups = c("", " - EM"),
+    scale = "MD", link = "identity", sm = "MD", eff_lab = "MD",
+    x_range = c(-30, 15), x_by = 10, x_label = "Mean Difference (MIDAS)",
+    # ROPE: NAO reportada (PROSA da orientadora: "prefiro nao reportar ROPE para esse desfecho";
+    # +/-5 satisfeita por construcao, limiar depende do basal, escala assimetrica).
+    # CONFLITO A RESOLVER: a TABELA dela lista +/-5.0 -> seguindo a PROSA por ora.
+    rope_primary = NULL, rope_sensitivity = NULL,
+    # mu vago N(0,510^2) (tabela). tau weakly via tool (extremo=30).
+    # tau VAGUE via TOOL (extremo=60), NÃO HN(4): a escala fixa 4 esmagava os dados do MIDAS
+    # (decisão explícita do Arthur — prior vago proporcional à escala do MIDAS).
+    mu_vague_mean = 0, mu_vague_sd = 510,
+    extreme_tau = 30, tau_restricted_scale = 1.0, extreme_tau_vague = 60, extreme_mu = 60
+  ),
+  
+  # ── Responder >=50% (RR) — escala log-RR ───────────────────────────────────
+  responder = list(
+    base = "Responder Rates / 12w", subgroups = c("", " - CM", " - EM"),
+    scale = "RR", link = "log", sm = "RR", eff_lab = "RR",
+    x_range = c(log(0.5), log(2)), x_by = 0.35, x_label = "Risk Ratio (log scale)",
+    # ROPE na escala RR: 0.90–1.11 (~±5 pp sobre ~47%, NNT ~20); sens 0.80–1.25
+    rope_primary = c(0.90, 1.11), rope_sensitivity = c(0.80, 1.25),
+    # Priors da tabela do Arthur (escala RELATIVA/OR): mu vago N(0,2.7^2) primário;
+    # mu weakly N(0,0.82^2) sensibilidade; tau weakly HN(0.5) primário; tau vago HN(1.5) sens.
+    # (Informative de tau NÃO usado — só validado p/ OR, conforme e-mail.)
+    mu_vague_mean = 0, mu_vague_sd = 2.7,
+    tau_weakly_scale = 0.5, tau_restricted_scale = 0.125, tau_vague_scale = 1.5, mu_sens_sd = 0.82
+  ),
+  
+  # ── Adverse effects (RR) — dano: ROPE assimétrica (ver nota) ───────────────
+  ae = list(
+    base = "Adverse effects / 12w", subgroups = c("", " - EM", " - CM"),
+    scale = "RR", link = "log", sm = "RR", eff_lab = "RR",
+    x_range = c(log(0.5), log(2)), x_by = 0.35, x_label = "Risk Ratio (log scale)",
+    # ROPE ASSIMETRICA adotada [0.90, 1.05]: para dano, a tolerancia a excesso de risco deve ser
+    # MENOR que a exigencia de beneficio -> teto (1.05) mais estrito que o piso (0.90).
+    # Sensibilidade "não recomendo" -> NULL.
+    rope_primary = c(0.90, 1.05), rope_sensitivity = NULL,
+    # Priors da tabela do Arthur (escala RELATIVA/OR), iguais ao Responder.
+    mu_vague_mean = 0, mu_vague_sd = 2.7,
+    tau_weakly_scale = 0.5, tau_restricted_scale = 0.125, tau_vague_scale = 1.5, mu_sens_sd = 0.82
+  )
+)
+
+# Quais desfechos rodar (comente para pular). Subgrupos vêm de $subgroups (agrupado+CM+EM).
+outcomes_to_run <- c("mmd_4w", "mmd_12w", "hit6", "midas", "responder", "ae")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -55,8 +164,8 @@ if (!requireNamespace("BayesianPriorsTool", quietly = TRUE))
   devtools::install_github("arthur-albuquerque/BayesianPriorsTool")
 
 pacman::p_load(
-  googlesheets4, ragg, officer, bayesmeta, BayesianPriorsTool, 
-  dplyr, tidyr, metafor, ggdist, ggplot2, patchwork, meta, 
+  googlesheets4, ragg, officer, bayesmeta, BayesianPriorsTool,
+  dplyr, tidyr, metafor, ggdist, ggplot2, patchwork, meta,
   janitor, future, future.apply
 )
 
@@ -65,19 +174,16 @@ pacman::p_load(
 # §2 — AUTENTICAÇÃO E TEMA
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Desautenticação para ler planilhas públicas (Qualquer pessoa com o link) sem login
-gs4_deauth()
+gs4_deauth()  # planilha pública (qualquer pessoa com o link)
 
 theme_set(
   theme(
     plot.title.position = "plot",
-    axis.ticks.x        = element_blank(),
-    axis.ticks.y        = element_blank(),
-    axis.text.x         = element_text(size = 12),
-    axis.text.y         = element_text(size = 12),
-    axis.title.x        = element_text(size = 14),
-    panel.background    = element_blank(),
-    panel.grid.major.x  = element_line(color = "gray80", linewidth = 0.3)
+    axis.ticks.x = element_blank(), axis.ticks.y = element_blank(),
+    axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    panel.background = element_blank(),
+    panel.grid.major.x = element_line(color = "gray80", linewidth = 0.3)
   )
 )
 
@@ -87,9 +193,8 @@ theme_set(
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 log_error <- function(context, error_msg) {
-  log_path <- file.path(output_dir, "pipeline_errors.log")
   write(paste0("[", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "] ", context, " — ", error_msg),
-        file = log_path, append = TRUE)
+        file = file.path(output_dir, "pipeline_errors.log"), append = TRUE)
 }
 
 save_plot <- function(filename_base, plot_fn, out_dir, width = 16, height = 10) {
@@ -106,116 +211,160 @@ save_docx <- function(filename_base, lines, out_dir) {
   print(doc, target = file.path(out_dir, paste0(filename_base, ".docx")))
 }
 
-get_summary <- function(model) {
-  list(
-    mu_mean     = model$summary["mean",      "mu"],
-    mu_upper    = model$summary["95% upper", "mu"],
-    mu_lower    = model$summary["95% lower", "mu"],
-    tau_median  = model$summary["median",    "tau"],
-    tau_upper   = model$summary["95% upper", "tau"],
-    tau_lower   = model$summary["95% lower", "tau"],
-    theta_mean  = model$summary["mean",      "theta"],
-    theta_upper = model$summary["95% upper", "theta"],
-    theta_lower = model$summary["95% lower", "theta"]
-  )
-}
+get_summary <- function(model) list(
+  mu_mean = model$summary["mean","mu"], mu_upper = model$summary["95% upper","mu"], mu_lower = model$summary["95% lower","mu"],
+  tau_median = model$summary["median","tau"], tau_upper = model$summary["95% upper","tau"], tau_lower = model$summary["95% lower","tau"],
+  theta_mean = model$summary["mean","theta"], theta_upper = model$summary["95% upper","theta"], theta_lower = model$summary["95% lower","theta"]
+)
 
 should_run_loo <- function(sheet) isTRUE(loo_config[sheet])
 
 get_forest_labels <- function(sheet, left, right) {
-  if (isTRUE(invert_labels_config[sheet])) list(left = right, right = left)
-  else list(left = left,  right = right)
+  if (isTRUE(invert_labels_config[sheet])) list(left = right, right = left) else list(left = left, right = right)
 }
 
-generate_posterior_plots_md <- function(model, fill_color, is_predict = FALSE, x_range = md_x_range, x_by = md_x_by, x_lab = md_x_label) {
+# Coerção robusta p/ numérico: trata list-columns do googlesheets4, texto e vírgula decimal
+num <- function(x) {
+  if (is.list(x)) x <- vapply(x, function(v) if (length(v) == 0 || is.null(v)) NA_character_ else as.character(v)[1], character(1))
+  suppressWarnings(as.numeric(gsub(",", ".", trimws(as.character(x)))))
+}
+
+# Transformações de escala (identidade p/ MD, log p/ RR)
+trans_fwd <- function(x, link) if (link == "log") log(x) else x
+trans_inv <- function(x, link) if (link == "log") exp(x) else x
+
+# Resolve priors do cfg em funções half-normal + parâmetros de mu
+resolve_priors <- function(cfg) {
+  # tau weakly e tau vague podem vir de ESCALA FIXA ou da FERRAMENTA (via "extremo").
+  tau_weakly_scale <- if (!is.null(cfg$extreme_tau))       tau_prior_scale(cfg$extreme_tau)       else cfg$tau_weakly_scale
+  tau_vague_scale  <- if (!is.null(cfg$extreme_tau_vague)) tau_prior_scale(cfg$extreme_tau_vague) else cfg$tau_vague_scale
+  mu_sens_sd       <- if (!is.null(cfg$extreme_mu))        mu_prior_sd(cfg$extreme_mu)            else cfg$mu_sens_sd
+  list(
+    tau_weakly_scale = tau_weakly_scale, tau_vague_scale = tau_vague_scale, mu_sens_sd = mu_sens_sd,
+    tau_weakly     = function(x) dhalfnormal(x, scale = tau_weakly_scale),
+    tau_restricted = function(x) dhalfnormal(x, scale = cfg$tau_restricted_scale),
+    tau_vague      = function(x) dhalfnormal(x, scale = tau_vague_scale)
+  )
+}
+
+# Decisão HDI+ROPE (usa o CrI/IC central de 95% na escala do MODELO)
+rope_decision <- function(ci_lo_m, ci_hi_m, lo_m, hi_m) {
+  if (ci_lo_m >= lo_m && ci_hi_m <= hi_m)     "Practical equivalence (95% CrI within ROPE)"
+  else if (ci_hi_m < lo_m || ci_lo_m > hi_m)  "Relevant difference (95% CrI outside ROPE)"
+  else                                        "Undecided (95% CrI overlaps ROPE)"
+}
+
+# bounds_report = c(lo, hi) na escala de REPORTE; link define transformação p/ modelo
+rope_from_bayesmeta <- function(model, bounds_report, link) {
+  lo_m <- trans_fwd(bounds_report[1], link); hi_m <- trans_fwd(bounds_report[2], link)
+  ci_lo_m <- model$summary["95% lower","mu"]; ci_hi_m <- model$summary["95% upper","mu"]
+  list(
+    p_in    = as.numeric(model$pposterior(mu = hi_m) - model$pposterior(mu = lo_m)),
+    p_below = as.numeric(model$pposterior(mu = lo_m)),
+    p_above = as.numeric(1 - model$pposterior(mu = hi_m)),
+    ci_lo   = trans_inv(ci_lo_m, link), ci_hi = trans_inv(ci_hi_m, link),
+    decision = rope_decision(ci_lo_m, ci_hi_m, lo_m, hi_m)
+  )
+}
+
+# Análogo p/ o modelo Common-Effect (frequentista): aproximação normal (dist. de confiança)
+rope_from_normal <- function(est_m, se_m, ci_lo_m, ci_hi_m, bounds_report, link) {
+  lo_m <- trans_fwd(bounds_report[1], link); hi_m <- trans_fwd(bounds_report[2], link)
+  list(
+    p_in    = pnorm(hi_m, est_m, se_m) - pnorm(lo_m, est_m, se_m),
+    p_below = pnorm(lo_m, est_m, se_m),
+    p_above = 1 - pnorm(hi_m, est_m, se_m),
+    ci_lo   = trans_inv(ci_lo_m, link), ci_hi = trans_inv(ci_hi_m, link),
+    decision = rope_decision(ci_lo_m, ci_hi_m, lo_m, hi_m)
+  )
+}
+
+# Gráficos posterior (densidade + P(effect <= x)) na escala do MODELO
+generate_posterior_plots <- function(model, fill_color, cfg, is_predict = FALSE) {
   set.seed(123)
-  samples    <- model$rposterior(n = 10000, tau.sample = FALSE, predict = is_predict)
-  df_s       <- data.frame(samples = samples)
-  cutoff_seq <- seq(x_range[1], x_range[2], by = 1)
-  
-  p_dens <- ggplot(df_s, aes(x = samples)) +
+  samples <- model$rposterior(n = 10000, tau.sample = FALSE, predict = is_predict)
+  cutoff_seq <- seq(cfg$x_range[1], cfg$x_range[2], length.out = 60)
+  p_dens <- ggplot(data.frame(samples = samples), aes(x = samples)) +
     ggdist::stat_halfeye(.width = 0.95, point_interval = "mean_hdi", fill = fill_color) +
-    labs(x = paste0("\n", x_lab), y = "Density") +
-    theme(axis.text.y = element_blank())
-  
+    labs(x = paste0("\n", cfg$x_label), y = "Density") + theme(axis.text.y = element_blank())
   probs <- if (is_predict) model$pposterior(theta = cutoff_seq, predict = TRUE) else model$pposterior(mu = cutoff_seq)
   p_prob <- ggplot(data.frame(cutoffs = cutoff_seq, probs = probs), aes(x = cutoffs, y = probs)) +
     geom_line() +
-    scale_x_continuous(breaks = seq(x_range[1], x_range[2], by = x_by)) +
+    scale_x_continuous(breaks = seq(cfg$x_range[1], cfg$x_range[2], by = cfg$x_by)) +
     scale_y_continuous(breaks = seq(0, 1, by = 0.2)) +
-    labs(x = paste0("\n", x_lab), y = expression("Probability MD" <= "X")) +
+    labs(x = paste0("\n", cfg$x_label), y = expression("Probability effect" <= "X")) +
     theme(panel.grid.major.y = element_line(color = "gray80", linewidth = 0.3))
-  
   list(density = p_dens, probability = p_prob)
+}
+
+# Bloco de tabela ROPE (texto largura fixa)
+rope_block <- function(title, bounds_report, rows, scen_names, report_null) {
+  sep <- paste(rep("-", 124), collapse = "")
+  hdr <- sprintf("%-48s | %-9s | %-9s | %-9s | %-20s | %s",
+                 "Scenario (tau prior)", "P(inside)", "P(below)", "P(above)", "95% (Cr)I", "Decision")
+  body <- vapply(seq_along(rows), function(i) {
+    r <- rows[[i]]
+    sprintf("%-48s | %7.1f%%  | %7.1f%%  | %7.1f%%  | [%6.2f, %6.2f] | %s",
+            scen_names[i], 100*r$p_in, 100*r$p_below, 100*r$p_above, r$ci_lo, r$ci_hi, r$decision)
+  }, character(1))
+  c(sprintf("%s  (ROPE = [%.2f, %.2f]; null = %.2f)", title, bounds_report[1], bounds_report[2], report_null),
+    sep, hdr, sep, body, "")
 }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# §4 — FASE 2: Leave-One-Out (LOO) 
+# §4 — LEAVE-ONE-OUT (opcional; escala-agnóstico via yi/sei)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-run_loo_analysis <- function(dat, full_model, mu_mean, mu_sd, tau_prior_func, label_col, out_dir, sheet_name) {
-  K      <- nrow(dat)
-  eff_lb <- "MD"
-  
-  plan(multisession)
-  on.exit(plan(sequential), add = TRUE)
-  
+run_loo_analysis <- function(dat, full_model, mu_mean, mu_sd, tau_prior_func, labels, out_dir, sheet_name, cfg) {
+  K <- nrow(dat); eff_lb <- cfg$eff_lab
+  plan(multisession); on.exit(plan(sequential), add = TRUE)
   loo_list <- future_lapply(seq_len(K), function(i) {
-    dat_loo <- dat[-i, ]
-    fit     <- bayesmeta(y = dat_loo$yi, sigma = dat_loo$sei, labels = dat_loo[[label_col]],
-                         mu.prior.mean = mu_mean, mu.prior.sd = mu_sd, tau.prior = tau_prior_func)
-    list(study_excluded = dat[[label_col]][i], estimate = fit$summary["median", "mu"],
-         ci_lower = fit$summary["95% lower", "mu"], ci_upper = fit$summary["95% upper", "mu"],
-         tau_median = fit$summary["median", "tau"])
+    fit <- bayesmeta(y = dat$yi[-i], sigma = dat$sei[-i], labels = labels[-i],
+                     mu.prior.mean = mu_mean, mu.prior.sd = mu_sd, tau.prior = tau_prior_func)
+    list(study_excluded = labels[i],
+         estimate = trans_inv(fit$summary["median","mu"], cfg$link),
+         ci_lower = trans_inv(fit$summary["95% lower","mu"], cfg$link),
+         ci_upper = trans_inv(fit$summary["95% upper","mu"], cfg$link),
+         tau_median = fit$summary["median","tau"])
   }, future.seed = TRUE)
-  
   loo_res <- data.frame(
     study_excluded = sapply(loo_list, `[[`, "study_excluded"), estimate = sapply(loo_list, `[[`, "estimate"),
     ci_lower = sapply(loo_list, `[[`, "ci_lower"), ci_upper = sapply(loo_list, `[[`, "ci_upper"),
     tau_median = sapply(loo_list, `[[`, "tau_median"), stringsAsFactors = FALSE
   )
-  
-  full_mu    <- full_model$summary["median", "mu"]
-  full_mu_lo <- full_model$summary["95% lower", "mu"]
-  full_mu_hi <- full_model$summary["95% upper", "mu"]
-  
-  m_ref <- metagen(sm = "MD", TE = c(loo_res$estimate, full_mu), lower = c(loo_res$ci_lower, full_mu_lo),
-                   upper = c(loo_res$ci_upper, full_mu_hi), studlab = c(paste0("Omitting: ", loo_res$study_excluded), "Full Analysis (Reference)"),
-                   random = FALSE, fixed = FALSE)
-  
-  sq_col <- c(rep("steelblue", K), "firebrick")
-  loo_h  <- max(10, (K + 1) * 0.45 + 5)
-  
+  full_mu <- trans_inv(full_model$summary["median","mu"], cfg$link)
+  full_lo <- trans_inv(full_model$summary["95% lower","mu"], cfg$link)
+  full_hi <- trans_inv(full_model$summary["95% upper","mu"], cfg$link)
+  m_ref <- metagen(sm = cfg$sm, TE = trans_fwd(c(loo_res$estimate, full_mu), cfg$link),
+                   lower = trans_fwd(c(loo_res$ci_lower, full_lo), cfg$link),
+                   upper = trans_fwd(c(loo_res$ci_upper, full_hi), cfg$link),
+                   studlab = c(paste0("Omitting: ", loo_res$study_excluded), "Full Analysis (Reference)"),
+                   random = FALSE, common = FALSE)
+  sq_col <- c(rep("steelblue", K), "firebrick"); loo_h <- max(10, (K + 1) * 0.45 + 5)
   save_plot("Supp_Fig_5_LOO_Forest", function() {
-    meta::forest(m_ref, leftcols = "studlab", leftlabs = "Study", rightcols = c("effect", "ci"),
-                 rightlabs = c(eff_lb, "95% CrI"), xlab = "Mean Difference (MMD)", smlab = "", weight.study = "same",
-                 col.square = sq_col, col.square.lines = sq_col, overall = FALSE, print.tau2 = FALSE, print.I2 = FALSE,
-                 print.pval.Q = FALSE, hetstat = FALSE, overall.hetstat = FALSE)
+    meta::forest(m_ref, leftcols = "studlab", leftlabs = "Study", rightcols = c("effect","ci"),
+                 rightlabs = c(eff_lb, "95% CrI"), xlab = cfg$x_label, smlab = "", weight.study = "same",
+                 col.square = sq_col, col.square.lines = sq_col, overall = FALSE, hetstat = FALSE, overall.hetstat = FALSE)
   }, out_dir, height = loo_h)
-  
-  fmt <- function(e, lo, hi) sprintf("%6.2f [%6.2f, %6.2f]", e, lo, hi)
-  hdr <- sprintf("%-32s | %-22s | %s", "Study Excluded", paste0(eff_lb, " [95% CrI]"), "tau (median)")
+  fmt <- function(e, lo, hi) sprintf("%8.3f [%8.3f, %8.3f]", e, lo, hi)
+  hdr <- sprintf("%-32s | %-30s | %s", "Study Excluded", paste0(eff_lb, " [95% CrI]"), "tau (median)")
   rows <- vapply(seq_len(nrow(loo_res)), function(i) {
-    r <- loo_res[i, ]
-    sprintf("%-32s | %-22s | %.3f", r$study_excluded, fmt(r$estimate, r$ci_lower, r$ci_upper), r$tau_median)
+    r <- loo_res[i, ]; sprintf("%-32s | %-30s | %.3f", r$study_excluded, fmt(r$estimate, r$ci_lower, r$ci_upper), r$tau_median)
   }, character(1))
-  ref_row <- sprintf("%-32s | %-22s | %s", "Full Analysis (Reference)", fmt(full_mu, full_mu_lo, full_mu_hi), "—")
-  
-  save_docx("Supp_Table_2_LOO_Results", c(
-    paste0("LOO Sensitivity Analysis: ", sheet_name), paste(rep("-", 72), collapse = ""), hdr,
-    paste(rep("-", 72), collapse = ""), rows, paste(rep("-", 72), collapse = ""), ref_row
-  ), out_dir)
+  ref_row <- sprintf("%-32s | %-30s | %s", "Full Analysis (Reference)", fmt(full_mu, full_lo, full_hi), "-")
+  save_docx("Supp_Table_2_LOO_Results", c(paste0("LOO: ", sheet_name), paste(rep("-",80),collapse=""),
+                                          hdr, paste(rep("-",80),collapse=""), rows, paste(rep("-",80),collapse=""), ref_row), out_dir)
 }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# §5 — ANÁLISE PRINCIPAL (Mean Difference - MMD)
+# §5 — ANÁLISE UNIFICADA (MD e RR) POR ABA
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-run_bayesian_meta <- function(sheet, base_dir = output_dir) {
+run_analysis <- function(sheet, cfg, base_dir = output_dir) {
   
-  dat <- tryCatch({ as.data.frame(read_sheet(url, sheet = sheet)) |> janitor::clean_names() }, 
+  dat <- tryCatch(as.data.frame(read_sheet(url, sheet = sheet)) |> janitor::clean_names(),
                   error = function(e) { log_error(paste0("read_sheet — ", sheet), e$message); NULL })
   if (is.null(dat)) return(invisible(NULL))
   
@@ -225,130 +374,209 @@ run_bayesian_meta <- function(sheet, base_dir = output_dir) {
   dir.create(out_dir_meth, showWarnings = FALSE, recursive = TRUE)
   dir.create(out_dir_resu, showWarnings = FALSE, recursive = TRUE)
   
-  # ── Dados ───────────────────────────────────────────────────────────────────
-  # Padroniza a coluna de identificação (study ou source)
-  label_col <- if("source" %in% names(dat)) "source" else "study"
-  dat       <- dat[!is.na(dat[[label_col]]), ]
+  # ── Rótulos + escalc por escala ───────────────────────────────────────────
+  if (cfg$scale == "MD") {
+    labels <- trimws(as.character(dat$source))
+    keep   <- !is.na(labels) & nzchar(labels)                 # descarta linhas sem rótulo/vazias
+    dat    <- dat[keep, ]; labels <- labels[keep]
+    for (col in c("m1i","sd1i","n1i","m2i","sd2i","n2i")) dat[[col]] <- num(dat[[col]])  # força numérico
+    dd <- escalc(measure = "MD", m1i = m1i, sd1i = sd1i, n1i = n1i, m2i = m2i, sd2i = sd2i, n2i = n2i, data = dat) |> data.frame()
+  } else { # RR
+    labels <- trimws(paste(dat$author, dat$year))
+    keep   <- !is.na(dat$author) & nzchar(trimws(as.character(dat$author)))
+    dat    <- dat[keep, ]; labels <- labels[keep]
+    if (!("ci" %in% names(dat)) && ("a2" %in% names(dat))) dat$ci <- dat$a2  # eventos grupo 2: 'ci' OU 'a2'
+    for (col in c("ai","n1i","ci","n2i")) dat[[col]] <- num(dat[[col]])       # força numérico
+    dd <- escalc(measure = "RR", ai = ai, n1i = n1i, ci = ci, n2i = n2i, data = dat) |> data.frame()
+  }
+  dd$sei <- sqrt(dd$vi)
+  ok <- is.finite(dd$yi) & is.finite(dd$sei)   # máscara ANTES de filtrar (mantém labels alinhados)
+  dd <- dd[ok, ]; labels <- labels[ok]
+  if (nrow(dd) < 2) stop("Menos de 2 estudos validos em '", sheet, "'.")
   
-  dat_MD <- escalc(measure = "MD", m1i = m1i, sd1i = sd1i, n1i = n1i, m2i = m2i, sd2i = sd2i, n2i = n2i, data = dat) |> data.frame()
-  dat_MD$sei <- sqrt(dat_MD$vi)
+  pr <- resolve_priors(cfg)
   
-  if (nrow(dat_MD) < 2) stop("Menos de 2 estudos validos em '", sheet, "'.")
+  # ── Modelos ────────────────────────────────────────────────────────────────
+  bm <- function(tau_fn, mu_mean, mu_sd) bayesmeta(y = dd$yi, sigma = dd$sei, labels = labels,
+                                                   mu.prior.mean = mu_mean, mu.prior.sd = mu_sd, tau.prior = tau_fn)
+  meta_primary    <- bm(pr$tau_weakly,     cfg$mu_vague_mean, cfg$mu_vague_sd)   # vago mu + weakly tau (PRIMÁRIO)
+  meta_sens       <- bm(pr$tau_vague,      0,                 pr$mu_sens_sd)     # sensibilidade do prior de MU
+  meta_restricted <- bm(pr$tau_restricted, cfg$mu_vague_mean, cfg$mu_vague_sd)   # tau restrito
+  meta_vague_tau  <- bm(pr$tau_vague,      cfg$mu_vague_mean, cfg$mu_vague_sd)   # tau vago (mu vago fixo)
+  ee <- metafor::rma(yi = dd$yi, vi = dd$vi, method = "EE", slab = labels)       # Common-Effect (piso)
+  ee_est <- as.numeric(ee$beta); ee_se <- as.numeric(ee$se); ee_lo <- as.numeric(ee$ci.lb); ee_hi <- as.numeric(ee$ci.ub)
   
-  # ── Priors Construídos via Função ──────────────────────────────────────────
-  scale_tau_prim <- tau_prior_scale(extreme_tau_MD)
-  sd_mu_sens     <- mu_prior_sd(extreme_mu_MD)
+  post_prim <- get_summary(meta_primary); post_sens <- get_summary(meta_sens)
   
-  prior_tau_weakly_func <- function(x) dhalfnormal(x, scale = scale_tau_prim)
-  prior_tau_vague_func  <- function(x) dhalfnormal(x, scale = vague_tau_MD_scale)
+  # ── Forest base ─────────────────────────────────────────────────────────────
+  if (cfg$scale == "MD") {
+    forest_base <- metacont(data = dd, studlab = labels, mean.e = m1i, sd.e = sd1i, n.e = n1i,
+                            mean.c = m2i, sd.c = sd2i, n.c = n2i, sm = "MD", common = FALSE, random = FALSE)
+    left_cols <- c("studlab","mean.e","sd.e","n.e","mean.c","sd.c","n.c","effect.ci")
+    left_labs <- c("Study", NA, NA, NA, NA, NA, NA, cfg$eff_lab)
+  } else {
+    forest_base <- metabin(data = dd, studlab = labels, event.e = ai, n.e = n1i, event.c = ci, n.c = n2i,
+                           sm = "RR", common = FALSE, random = FALSE)
+    left_cols <- c("studlab","event.e","n.e","event.c","n.c","effect.ci")
+    left_labs <- c("Study","Events","N","Events","N", cfg$eff_lab)
+  }
   
-  plot_mu_primary_prior  <- mu_dist_viz(mean = prior_mu_vague_mean_MD, sd = prior_mu_vague_sd_MD, scale = "absolute", xlabel = md_x_label)
-  plot_tau_primary_prior <- tau_prior_plot(extreme_tau_MD)
-  plot_mu_sens_prior     <- mu_dist_viz(mean = 0, sd = sd_mu_sens, scale = "absolute", xlabel = md_x_label)
-  plot_tau_vague_prior   <- tau_dist_viz(dist = "half-normal", scale = vague_tau_MD_scale)
+  mf_prim      <- metaadd(forest_base, type = "random",     TE = post_prim$mu_mean,    upper = post_prim$mu_upper,    lower = post_prim$mu_lower)
+  mf_prim_pred <- metaadd(mf_prim,     type = "prediction", TE = post_prim$theta_mean, upper = post_prim$theta_upper, lower = post_prim$theta_lower)
+  mf_sens      <- metaadd(forest_base, type = "random",     TE = post_sens$mu_mean,    upper = post_sens$mu_upper,    lower = post_sens$mu_lower)
+  mf_sens_pred <- metaadd(mf_sens,     type = "prediction", TE = post_sens$theta_mean, upper = post_sens$theta_upper, lower = post_sens$theta_lower)  # FIX simetria
   
-  # ── Modelos ──────────────────────────────────────────────────────────────────
-  meta_MD_primary <- bayesmeta(y = dat_MD$yi, sigma = dat_MD$sei, labels = dat_MD[[label_col]],
-                               mu.prior.mean = prior_mu_vague_mean_MD, mu.prior.sd = prior_mu_vague_sd_MD, tau.prior = prior_tau_weakly_func)
-  meta_MD_sens    <- bayesmeta(y = dat_MD$yi, sigma = dat_MD$sei, labels = dat_MD[[label_col]],
-                               mu.prior.mean = 0, mu.prior.sd = sd_mu_sens, tau.prior = prior_tau_vague_func)
-  
-  post_prim <- get_summary(meta_MD_primary)
-  post_sens <- get_summary(meta_MD_sens)
-  
-  # ── Forest base ──────────────────────────────────────────────────────────────
-  forest_data_MD <- metacont(data = dat_MD, studlab = dat_MD[[label_col]],
-                             mean.e = m1i, sd.e = sd1i, n.e = n1i, mean.c = m2i, sd.c = sd2i, n.c = n2i,
-                             sm = "MD", common = FALSE, random = FALSE)
-  
-  mf_prim      <- metaadd(forest_data_MD, type = "random", TE = post_prim$mu_mean, upper = post_prim$mu_upper, lower = post_prim$mu_lower)
-  mf_prim_pred <- metaadd(mf_prim, type = "prediction", TE = post_prim$theta_mean, upper = post_prim$theta_upper, lower = post_prim$theta_lower)
-  mf_sens      <- metaadd(forest_data_MD, type = "random", TE = post_sens$mu_mean, upper = post_sens$mu_upper, lower = post_sens$mu_lower)
-  mf_sens_pred <- metaadd(forest_data_MD, type = "prediction", TE = post_sens$theta_mean, upper = post_sens$theta_upper, lower = post_sens$theta_lower)
-  
-  analyses_names <- c("Primary: Vague Mu / Weakly-Informative Tau", "Sensitivity: Weakly-Informative Mu / Vague Tau")
+  analyses_names <- c("Primary (mu: vague / tau: weakly-informative)", "Sensitivity (mu: weakly-informative / tau: vague)")
   all_overall <- metabind(mf_prim,      mf_sens,      name = analyses_names)
   all_predict <- metabind(mf_prim_pred, mf_sens_pred, name = analyses_names)
   
-  tau_fmt <- function(p) paste0("τ = ", round(p$tau_median, 2), " [95% CrI ", round(p$tau_lower, 2), ", ", round(p$tau_upper, 2), "]")
-  tau_prim_text <- tau_fmt(post_prim)
-  tau_sens_text <- tau_fmt(post_sens)
+  tau_fmt <- function(p) paste0("tau = ", round(p$tau_median,3), " [95% CrI ", round(p$tau_lower,3), ", ", round(p$tau_upper,3), "]")
+  tau_prim_text <- tau_fmt(post_prim); tau_sens_text <- tau_fmt(post_sens)
   
-  plots_prim <- generate_posterior_plots_md(meta_MD_primary, "skyblue")
-  plots_pred <- generate_posterior_plots_md(meta_MD_primary, "firebrick", is_predict = TRUE)
+  plots_prim <- generate_posterior_plots(meta_primary, "skyblue",   cfg)
+  plots_pred <- generate_posterior_plots(meta_primary, "firebrick", cfg, is_predict = TRUE)
   
-  p_mu_le0    <- round(meta_MD_primary$pposterior(mu    = 0)                      * 100, 2)
-  p_mu_gt0    <- round((1 - meta_MD_primary$pposterior(mu    = 0))                * 100, 2)
-  p_theta_le0 <- round(meta_MD_primary$pposterior(theta = 0, predict = TRUE)      * 100, 2)
-  p_theta_gt0 <- round((1 - meta_MD_primary$pposterior(theta = 0, predict = TRUE)) * 100, 2)
+  # P(effect <= null) e complementar; null = 0 na escala do modelo (MD=0, RR: log(1)=0)
+  report_null <- trans_inv(0, cfg$link)
+  p_le <- round(as.numeric(meta_primary$pposterior(mu = 0)) * 100, 2)
+  p_gt <- round((1 - as.numeric(meta_primary$pposterior(mu = 0))) * 100, 2)
+  p_theta_le <- round(as.numeric(meta_primary$pposterior(theta = 0, predict = TRUE)) * 100, 2)
+  p_theta_gt <- round((1 - as.numeric(meta_primary$pposterior(theta = 0, predict = TRUE))) * 100, 2)
   
-  n_studies     <- nrow(dat_MD)
-  forest_height <- max(10, n_studies * 0.4 + 5)
-  sens_height   <- max(8,  2 * 0.6 + 4)
-  lbl           <- get_forest_labels(sheet, label_left_MD, label_right_MD)
+  # ── Escada de heterogeneidade (isola tau; mu vago fixo) ─────────────────────
+  scen_names <- c("Common-Effect: tau = 0 (frequentist)",
+                  paste0("Restricted: tau ~ HN(", cfg$tau_restricted_scale, ")"),
+                  paste0("Weakly-Informative: tau ~ HN(", round(pr$tau_weakly_scale, 2), ") [PRIMARY]"),
+                  paste0("Vague: tau ~ HN(", round(pr$tau_vague_scale, 2), ")"))
+  scen_models <- list(meta_restricted, meta_primary, meta_vague_tau)  # bayesmeta (após EE)
   
-  # ── Exportações — Fase 1 ──────────────────────────────────────────────────
+  scen_est_m <- c(ee_est, sapply(scen_models, function(m) m$summary["mean","mu"]))
+  scen_lo_m  <- c(ee_lo,  sapply(scen_models, function(m) m$summary["95% lower","mu"]))
+  scen_hi_m  <- c(ee_hi,  sapply(scen_models, function(m) m$summary["95% upper","mu"]))
+  scen_tau   <- c(NA,     sapply(scen_models, function(m) m$summary["median","tau"]))
+  
+  m_scen <- metagen(sm = cfg$sm, TE = scen_est_m, lower = scen_lo_m, upper = scen_hi_m,
+                    studlab = scen_names, random = FALSE, common = FALSE)
+  scen_col <- c("firebrick","steelblue","steelblue","steelblue"); scen_h <- max(8, 4*0.6 + 4)
+  save_plot("Supp_Fig_4_Heterogeneity_Scenarios", function() {
+    meta::forest(m_scen, leftcols = "studlab", leftlabs = "Scenario (tau prior)",
+                 rightcols = c("effect","ci"), rightlabs = c(cfg$eff_lab, "95% (Cr)I"),
+                 xlab = cfg$x_label, smlab = "", weight.study = "same",
+                 col.square = scen_col, col.square.lines = scen_col, overall = FALSE, hetstat = FALSE, overall.hetstat = FALSE)
+  }, out_dir_resu, height = scen_h)
+  
+  fmt_ci <- function(e, lo, hi) sprintf("%8.3f [%8.3f, %8.3f]", e, lo, hi)
+  scen_hdr <- sprintf("%-48s | %-30s | %-14s", "Scenario (tau prior)", paste0(cfg$eff_lab, " [95% (Cr)I]"), "tau (median)")
+  scen_body <- vapply(seq_along(scen_names), function(i) {
+    tau_txt <- if (is.na(scen_tau[i])) "0 (fixed)" else sprintf("%.3f", scen_tau[i])
+    sprintf("%-48s | %-30s | %-14s", scen_names[i],
+            fmt_ci(trans_inv(scen_est_m[i], cfg$link), trans_inv(scen_lo_m[i], cfg$link), trans_inv(scen_hi_m[i], cfg$link)), tau_txt)
+  }, character(1))
+  save_docx("Supp_Table_4_Heterogeneity_Scenarios", c(
+    paste0("Outcome: ", sheet), "Supplementary Table 4 — Pooled Effect Across Heterogeneity-Prior Scenarios",
+    paste(rep("-",96),collapse=""), scen_hdr, paste(rep("-",96),collapse=""), scen_body
+  ), out_dir_resu)
+  
+  # ── ROPE (se definida) — sob TODOS os priors ────────────────────────────────
+  if (!is.null(cfg$rope_primary)) {
+    rope_rows_for <- function(bounds) list(
+      rope_from_normal(ee_est, ee_se, ee_lo, ee_hi, bounds, cfg$link),
+      rope_from_bayesmeta(meta_restricted, bounds, cfg$link),
+      rope_from_bayesmeta(meta_primary,    bounds, cfg$link),
+      rope_from_bayesmeta(meta_vague_tau,  bounds, cfg$link)
+    )
+    rope_lines <- c(
+      paste0("Outcome: ", sheet), "Supplementary Table 3 — ROPE (Region of Practical Equivalence)",
+      paste0("Report scale: ", ifelse(cfg$link == "log", "Risk Ratio", "Mean Difference")),
+      paste(rep("=",124),collapse=""), "",
+      rope_block("PRIMARY ROPE", cfg$rope_primary, rope_rows_for(cfg$rope_primary), scen_names, report_null)
+    )
+    if (!is.null(cfg$rope_sensitivity))
+      rope_lines <- c(rope_lines, rope_block("SENSITIVITY ROPE", cfg$rope_sensitivity, rope_rows_for(cfg$rope_sensitivity), scen_names, report_null))
+    save_docx("Supp_Table_3_ROPE_Analysis", rope_lines, out_dir_resu)
+  }
+  
+  # ── Forest principal ────────────────────────────────────────────────────────
+  n_studies <- nrow(dd); forest_height <- max(10, n_studies*0.4 + 5); sens_height <- max(8, 2*0.6 + 4)
+  lbl <- get_forest_labels(sheet, label_left_common, label_right_common)
+  
   save_plot("Figure_1_Forest_Primary", function() {
-    meta::forest(mf_prim_pred, layout = "RevMan5", sortvar = dat_MD[[label_col]], text.random = "Bayesian Summary",
-                 text.predict = "Bayesian 95% Prediction Interval", text.addline1 = tau_prim_text, smlab = "Mean Difference (MMD)",
-                 digits.mean = 2, digits.sd = 2, leftcols = c("studlab","mean.e","sd.e","n.e","mean.c","sd.c","n.c","effect.ci"),
-                 leftlabs = c("Study", NA, NA, NA, NA, NA, NA, "MD"), pooled.events = TRUE,
-                 label.e = label_e_MD, label.c = label_c_MD, label.left = lbl$left, label.right = lbl$right, colgap = "6mm")
+    meta::forest(mf_prim_pred, layout = "RevMan5", sortvar = labels, text.random = "Bayesian Summary",
+                 text.predict = "Bayesian 95% Prediction Interval", text.addline1 = tau_prim_text, smlab = cfg$x_label,
+                 digits.mean = 2, digits.sd = 2, leftcols = left_cols, leftlabs = left_labs, pooled.events = TRUE,
+                 # Desliga a heterogeneidade FREQUENTISTA do pacote meta (ela sairia como "95%-CI").
+                 # O tau BAYESIANO (95% CrI) e reportado via text.addline1 acima.
+                 hetstat = FALSE, print.tau2 = FALSE, print.tau = FALSE, print.I2 = FALSE, print.Q = FALSE, print.pval.Q = FALSE,
+                 label.e = label_e_common, label.c = label_c_common, label.left = lbl$left, label.right = lbl$right, colgap = "6mm")
   }, out_dir_main, height = forest_height)
   
   save_plot("Figure_2_Posterior_Dist", function() { print(plots_prim$density + plots_prim$probability) }, out_dir_main)
   
-  save_docx("Posterior_Probabilities", c(
-    paste0("Outcome: ", sheet), paste(rep("=", 60), collapse = ""), "",
-    "Primary Analysis — Posterior Probabilities", paste(rep("-", 50), collapse = ""),
-    paste0("P(MD <= 0): ", p_mu_le0,    "%"), paste0("P(MD >  0): ", p_mu_gt0,    "%"),
-    paste0("P(theta <= 0) [predictive]: ", p_theta_le0, "%"), paste0("P(theta >  0) [predictive]: ", p_theta_gt0, "%")
-  ), out_dir_main)
+  post_lines <- c(
+    paste0("Outcome: ", sheet), paste(rep("=",60),collapse=""), "",
+    "Primary Analysis — Posterior Probabilities", paste(rep("-",50),collapse=""),
+    sprintf("P(effect <= %.2f): %s%%", report_null, p_le), sprintf("P(effect >  %.2f): %s%%", report_null, p_gt),
+    sprintf("P(theta <= %.2f) [predictive]: %s%%", report_null, p_theta_le),
+    sprintf("P(theta >  %.2f) [predictive]: %s%%", report_null, p_theta_gt)
+  )
+  if (!is.null(cfg$rope_primary)) {
+    prim_rope_p <- rope_from_bayesmeta(meta_primary, cfg$rope_primary, cfg$link)
+    post_lines <- c(post_lines, "", "ROPE — Primary model", paste(rep("-",50),collapse=""),
+                    sprintf("Primary ROPE [%.2f, %.2f]: P(inside) = %s%% | %s", cfg$rope_primary[1], cfg$rope_primary[2],
+                            round(100*prim_rope_p$p_in,2), prim_rope_p$decision))
+  } else {
+    post_lines <- c(post_lines, "", "ROPE not reported for this outcome.")
+  }
+  save_docx("Posterior_Probabilities", post_lines, out_dir_main)
   
   save_docx("Model_Summaries", c(
-    paste0("Outcome: ", sheet), paste(rep("=", 60), collapse = ""), "",
-    paste0("=== Primary: Vague Mu / Weakly Tau [extreme_diff=", extreme_tau_MD, "] ==="),
-    capture.output(print(meta_MD_primary$summary)), "",
-    paste0("=== Sensitivity: Weakly Mu [extreme_diff=", extreme_mu_MD, "] / Vague Tau [Half-Normal(", vague_tau_MD_scale, ")] ==="),
-    capture.output(print(meta_MD_sens$summary))
+    paste0("Outcome: ", sheet), paste(rep("=",60),collapse=""), "",
+    "=== Primary: Vague Mu / Weakly Tau ===", capture.output(print(meta_primary$summary)), "",
+    "=== Sensitivity (MU prior): Weakly Mu / Vague Tau ===", capture.output(print(meta_sens$summary)), "",
+    paste0("=== Restricted Tau ~ HN(", cfg$tau_restricted_scale, ") / Vague Mu ==="), capture.output(print(meta_restricted$summary)), "",
+    paste0("=== Vague Tau ~ HN(", round(pr$tau_vague_scale, 2), ") / Vague Mu ==="), capture.output(print(meta_vague_tau$summary)), "",
+    "=== Common-Effect (equal-effects; tau^2 = 0; frequentist floor) ===", capture.output(print(ee))
   ), out_dir_main)
   
-  save_plot("01_Primary_Priors", function() { print(plot_mu_primary_prior / plot_tau_primary_prior) }, out_dir_meth, height = 12)
-  save_plot("02_Sensitivity_Priors", function() { print(plot_mu_sens_prior / plot_tau_vague_prior) }, out_dir_meth, height = 12)
+  # ── Priors viz (Supplementary_Methods) ──────────────────────────────────────
+  tryCatch({
+    plot_mu_primary  <- mu_dist_viz(mean = cfg$mu_vague_mean, sd = cfg$mu_vague_sd, scale = "absolute", xlabel = cfg$x_label)
+    plot_tau_vague   <- tau_dist_viz(dist = "half-normal", scale = pr$tau_vague_scale)
+    plot_tau_restr   <- tau_dist_viz(dist = "half-normal", scale = cfg$tau_restricted_scale)
+    save_plot("01_Primary_Mu_Prior",   function() print(plot_mu_primary),  out_dir_meth, height = 6)
+    save_plot("02_Vague_Tau_Prior",    function() print(plot_tau_vague),   out_dir_meth, height = 6)
+    save_plot("03_Restricted_Tau_Prior", function() print(plot_tau_restr), out_dir_meth, height = 6)
+  }, error = function(e) log_error(paste0("prior-viz — ", sheet), e$message))
+  
   save_plot("Supp_Fig_1_Posterior_Predictive", function() { print(plots_pred$density + plots_pred$probability) }, out_dir_resu)
-  save_plot("Supp_Fig_2_Sens_Overall_Effect", function() { meta::forest(all_overall, smlab = "Overall Effect (MD)", leftcols = "studlab") }, out_dir_resu, height = sens_height)
-  save_plot("Supp_Fig_3_Sens_Predictive", function() { meta::forest(all_predict, smlab = "95% Prediction Interval", leftcols = "studlab") }, out_dir_resu, height = sens_height)
+  save_plot("Supp_Fig_2_Sens_Overall_Effect",  function() { meta::forest(all_overall, smlab = paste0("Overall Effect (", cfg$eff_lab, ")"), leftcols = "studlab", hetstat = FALSE, overall.hetstat = FALSE) }, out_dir_resu, height = sens_height)
+  save_plot("Supp_Fig_3_Sens_Predictive",      function() { meta::forest(all_predict, smlab = "95% Prediction Interval", leftcols = "studlab", hetstat = FALSE, overall.hetstat = FALSE) }, out_dir_resu, height = sens_height)
   
   save_docx("Supp_Table_1_Heterogeneity", c(
-    paste0("Outcome: ", sheet), "Supplementary Table 1 — Between-Study Heterogeneity", paste(rep("-", 80), collapse = ""),
-    paste0("Primary (Vague Mu / Weakly Tau):     ", tau_prim_text), paste0("Sensitivity (Weakly Mu / Vague Tau): ", tau_sens_text)
+    paste0("Outcome: ", sheet), "Supplementary Table 1 — Between-Study Heterogeneity", paste(rep("-",80),collapse=""),
+    paste0("Primary (Vague Mu / Weakly Tau):     ", tau_prim_text),
+    paste0("Sensitivity (Weakly Mu / Vague Tau): ", tau_sens_text)
   ), out_dir_resu)
   
-  # ── Fase 2 — LOO manual ──────────────────────────────────────────────────────
+  # ── LOO (opcional) ──────────────────────────────────────────────────────────
   if (should_run_loo(sheet)) {
-    tryCatch(
-      run_loo_analysis(dat = dat_MD, full_model = meta_MD_primary, mu_mean = prior_mu_vague_mean_MD, mu_sd = prior_mu_vague_sd_MD,
-                       tau_prior_func = prior_tau_weakly_func, label_col = label_col, out_dir = out_dir_resu, sheet_name = sheet),
-      error = function(e) log_error(paste0("LOO — ", sheet), e$message)
-    )
+    tryCatch(run_loo_analysis(dat = dd, full_model = meta_primary, mu_mean = cfg$mu_vague_mean, mu_sd = cfg$mu_vague_sd,
+                              tau_prior_func = pr$tau_weakly, labels = labels, out_dir = out_dir_resu, sheet_name = sheet, cfg = cfg),
+             error = function(e) log_error(paste0("LOO — ", sheet), e$message))
   }
   invisible(NULL)
 }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# §6 — EXECUTAR
+# §6 — DISPATCH + EXECUTAR
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Executa SOMENTE as abas nomeadas abaixo:
-all_sheets <- c(
-  "Mean monthly migraine days, baseline to week 12 CM",
-  "Mean monthly migraine days, baseline to week 12 EM"
-)
-
-for (aba in all_sheets) {
-  tryCatch(
-    run_bayesian_meta(aba),
-    error = function(e) log_error(aba, e$message)
-  )
+for (oc in outcomes_to_run) {
+  cfg <- outcome_registry[[oc]]
+  if (is.null(cfg)) { log_error("registry", paste0("Desfecho nao encontrado: ", oc)); next }
+  for (suf in cfg$subgroups) {
+    sheet <- paste0(cfg$base, suf)
+    tryCatch(run_analysis(sheet, cfg), error = function(e) log_error(sheet, e$message))
+  }
 }
