@@ -10,8 +10,9 @@
 #   - MD (absoluto): mu vago N(0,510^2), tau vago HN(4); weakly via Prior Building Tool.
 #   - RR (relativo/OR): mu vago N(0,2.7^2), mu weakly N(0,0.82^2), tau weakly HN(0.5),
 #     tau vago HN(1.5). Informative de tau NÃO usado em RR (só validado p/ OR).
-# Restam A CONFIRMAR só as "diferenças extremas" (extreme_tau/extreme_mu) de HIT-6 e
-# MIDAS, que alimentam o weakly via tool. Restricted-tau + Common-Effect = camada de
+# Restam A CONFIRMAR só as "diferenças extremas" (extreme_tau/extreme_mu) de MIDAS,
+# que alimentam o weakly via tool. (HIT-6 já ancorado na extração: ext_tau=5, ext_mu=10.)
+# Restricted-tau + Common-Effect = camada de
 # "piso" pedida à parte (não está na tabela de priors).
 # Rode primeiro UMA aba (outcomes_to_run <- c("mmd_12w")) antes de gerar tudo.
 # ==============================================================================
@@ -22,7 +23,7 @@
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # Workbook "Stats - Davi" (limpo). Padrão de aba: "<desfecho> / <janela>[ - EM| - CM]".
-url        <- "https://docs.google.com/spreadsheets/d/1POa3MXDqlZe0CUZJIfrwDYM9KXcF3vmzoR2jnsQFRnM/edit?gid=1616647044#gid=1616647044"
+url        <- "https://docs.google.com/spreadsheets/d/1POa3MXDqlZe0CUZJIfrwDYM9KXcF3vmzoR2jnsQFRnM/edit?gid=237004916#gid=237004916"
 output_dir <- "/Users/davibarbosa/Desktop/Leite" # Ajuste
 
 # LOO por aba (TRUE = executar). Chave = nome EXATO da aba.
@@ -78,7 +79,10 @@ outcome_registry <- list(
     # +/-0.5 = sensibilidade. CAVEAT: EM=migraine days, CM=headache days(mod+). Belskaya: sem placebo.
     rope_primary = c(-1.0, 1.0), rope_sensitivity = c(-0.5, 0.5),
     mu_vague_mean = 0, mu_vague_sd = 510,
-    extreme_tau = 10, tau_restricted_scale = 0.125, tau_vague_scale = 4, extreme_mu = 20
+    # tau VAGO agora DERIVADO da regra (extreme=20 -> HN ~5.21), NÃO fixo em 4.
+    # Alinha mu e tau da sensibilidade ao mesmo extremo (20). tau_vague_scale=4 fica
+    # como fallback caso extreme_tau_vague seja removido.
+    extreme_tau = 10, tau_restricted_scale = 0.125, tau_vague_scale = 4, extreme_tau_vague = 20, extreme_mu = 20
   ),
   
   # ── MMD 12 semanas (MD) — PRIMÁRIO do estudo ───────────────────────────────
@@ -90,7 +94,8 @@ outcome_registry <- list(
     # placebo-ajustado (~1.7 dia, Sakai/HALO CM); +/-0.5 ~ 1/3. Confirmar metrica por ensaio.
     rope_primary = c(-1.0, 1.0), rope_sensitivity = c(-0.5, 0.5),
     mu_vague_mean = 0, mu_vague_sd = 510,
-    extreme_tau = 10, tau_restricted_scale = 0.125, tau_vague_scale = 4, extreme_mu = 20
+    # tau VAGO DERIVADO (extreme=20 -> HN ~5.21), não fixo em 4 (ver nota em mmd_4w).
+    extreme_tau = 10, tau_restricted_scale = 0.125, tau_vague_scale = 4, extreme_tau_vague = 20, extreme_mu = 20
   ),
   
   # ── HIT-6 (MD, pontos 36–78) — sem subgrupo EM ─────────────────────────────
@@ -100,9 +105,16 @@ outcome_registry <- list(
     x_range = c(-8, 4), x_by = 2, x_label = "Mean Difference (HIT-6)",
     # ROPE entre-grupos: 2.5 = limite inferior IHS (Diener) ~ Coeytaux between-group 2.3
     rope_primary = c(-2.5, 2.5), rope_sensitivity = c(-5.0, 5.0),
-    # Vago fixo p/ MD absoluto (tabela Arthur): mu N(0,510^2), tau HN(4). Weakly via tool.
+    # Vago fixo p/ MD absoluto (tabela Arthur): mu N(0,510^2). Weakly via tool.
     mu_vague_mean = 0, mu_vague_sd = 510,
-    extreme_tau = 10, tau_restricted_scale = 0.30, tau_vague_scale = 4, extreme_mu = 20  # extremos: >>> CONFIRMAR <<<
+    # Extremos ANCORADOS na extração do HIT-6 12w (4 estudos): maior |MD| entre-braços
+    # observado = 1.0 ponto; dispersão dos MDs ~0.42; MID individual IHS 2.3-5 pontos.
+    # Os extremos herdados do MMD (10/20) eram grandes demais p/ a escala 36-78 do HIT-6.
+    # Mantém o padrão dos demais desfechos (ext_mu = 2x ext_tau ; ext_tau_vague = 2x ext_tau):
+    #   extreme_tau=5      -> tau weakly HN(1.30)  [primário]
+    #   extreme_tau_vague=10 -> tau vague  HN(2.60)  [sensibilidade]
+    #   extreme_mu=10      -> mu weakly  N(0, 5.10) [sensibilidade de mu]; cobre o MD=1.0 com folga
+    extreme_tau = 5, tau_restricted_scale = 0.30, tau_vague_scale = 4, extreme_tau_vague = 10, extreme_mu = 10
   ),
   
   # ── MIDAS (MD, 0–270, assimétrico) — sem subgrupo CM; ROPE NÃO reportada ────
@@ -295,6 +307,30 @@ generate_posterior_plots <- function(model, fill_color, cfg, is_predict = FALSE)
     labs(x = paste0("\n", cfg$x_label), y = expression("Probability effect" <= "X")) +
     theme(panel.grid.major.y = element_line(color = "gray80", linewidth = 0.3))
   list(density = p_dens, probability = p_prob)
+}
+
+# Figura comparativa: TODOS os priors de tau lado a lado (restrito, weakly=PRIMÁRIO, vago).
+# Deixa explícito qual é o primário — atende ao comentário da orientadora de que o
+# prior primário de tau (weakly) precisa aparecer plotado ao lado dos demais.
+generate_tau_prior_comparison <- function(scale_restricted, scale_weakly, scale_vague) {
+  tau_axis <- seq(0, max(scale_vague * 4, 12), length.out = 4000)
+  mk <- function(s, lab) data.frame(tau = tau_axis, density = dhalfnormal(tau_axis, scale = s),
+                                    Prior = paste0(lab, ": Half-Normal(", round(s, 3), ")"))
+  df <- rbind(
+    mk(scale_restricted, "Restricted"),
+    mk(scale_weakly,     "Weakly-informative [PRIMARY]"),
+    mk(scale_vague,      "Vague")
+  )
+  # Ordena a legenda do mais restrito ao mais vago
+  df$Prior <- factor(df$Prior, levels = unique(df$Prior))
+  ggplot(df, aes(x = tau, y = density, color = Prior, fill = Prior)) +
+    geom_area(alpha = 0.15, position = "identity") +
+    geom_line(linewidth = 1.1) +
+    coord_cartesian(x = c(0, max(scale_vague * 3, 8))) +
+    labs(x = expression(paste("Between-study heterogeneity (", tau, ")")),
+         y = "Density", title = "Priors for the between-study heterogeneity (\u03C4)") +
+    theme(legend.position = "top", legend.title = element_blank(),
+          axis.text.y = element_blank(), plot.title = element_text(size = 15))
 }
 
 # Bloco de tabela ROPE (texto largura fixa)
@@ -543,9 +579,13 @@ run_analysis <- function(sheet, cfg, base_dir = output_dir) {
     plot_mu_primary  <- mu_dist_viz(mean = cfg$mu_vague_mean, sd = cfg$mu_vague_sd, scale = "absolute", xlabel = cfg$x_label)
     plot_tau_vague   <- tau_dist_viz(dist = "half-normal", scale = pr$tau_vague_scale)
     plot_tau_restr   <- tau_dist_viz(dist = "half-normal", scale = cfg$tau_restricted_scale)
+    plot_tau_weakly  <- tau_dist_viz(dist = "half-normal", scale = pr$tau_weakly_scale)  # PRIMÁRIO
+    plot_tau_compare <- generate_tau_prior_comparison(cfg$tau_restricted_scale, pr$tau_weakly_scale, pr$tau_vague_scale)
     save_plot("01_Primary_Mu_Prior",   function() print(plot_mu_primary),  out_dir_meth, height = 6)
     save_plot("02_Vague_Tau_Prior",    function() print(plot_tau_vague),   out_dir_meth, height = 6)
     save_plot("03_Restricted_Tau_Prior", function() print(plot_tau_restr), out_dir_meth, height = 6)
+    save_plot("04_Primary_Weakly_Tau_Prior", function() print(plot_tau_weakly), out_dir_meth, height = 6)  # tau PRIMÁRIO isolado
+    save_plot("05_All_Tau_Priors_Comparison", function() print(plot_tau_compare), out_dir_meth, height = 8) # os três sobrepostos
   }, error = function(e) log_error(paste0("prior-viz — ", sheet), e$message))
   
   save_plot("Supp_Fig_1_Posterior_Predictive", function() { print(plots_pred$density + plots_pred$probability) }, out_dir_resu)
