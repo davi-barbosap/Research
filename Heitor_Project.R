@@ -2,21 +2,14 @@ if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
 pacman::p_load(meta, dmetar, googlesheets4, ragg, officer, ggplot2, ggrepel)
 
 # ── Setup ──────────────────────────────────────────────────────────────────────
-url        <- "https://docs.google.com/spreadsheets/d/1PEYMRaguTvPBNtX5vBW9Zh0wIP0abIpalwikFCqoOtw/edit?gid=1445029508#gid=1445029508"
+url        <- "https://docs.google.com/spreadsheets/d/1oaYV44D66lrTo_HGm36nMmwuaHhScHZ640ag50mvQvc/edit?gid=1880320687#gid=1880320687"
 output_dir <- "/Users/davibarbosa/Desktop/Heitor"
 
 # Desativa a autenticação para ler links públicos sem pedir login
 gs4_deauth()
 
-# Define apenas as abas específicas que você quer rodar
-all_sheets <- c(
-  "Δbaseline Post-treatment LH - PP", 
-  "Δbaseline Post-treatment LH - ITT", 
-  "Δbaseline Post-treatment prolactin- PP", 
-  "Δbaseline Post-treatment prolactin- ITT"
-)
+all_sheets <- googlesheets4::sheet_names(url)
 
-cat("Abas selecionadas para análise:\n")
 print(all_sheets)
 
 # ── Visual theme ───────────────────────────────────────────────────────────────
@@ -79,8 +72,8 @@ save_docx <- function(filename_base, lines, out_dir) {
   digits.sd           = 2,
   label.e             = "Cyproterone acetate",
   label.c             = "Spironolactone",
-  label.left          = "Favors cyproterone acetate",
-  label.right         = "Favors spironolactone",
+  label.left          = "Favors spironolactone",
+  label.right         = "Favors cyproterone acetate",
   colgap              = "6mm",
   colgap.forest       = "6mm",
   print.pval.Q        = TRUE,
