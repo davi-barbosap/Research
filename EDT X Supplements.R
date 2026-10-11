@@ -28,12 +28,14 @@ pacman::p_load(
   ggplot2,       # Network plot estético
   ragg,          # Dispositivos gráficos de alta qualidade (TIFF)
   magick,        # Conversão TIFF → PNG (primeira página)
-  officer        # Escrita de .docx
+  officer,       # Escrita de .docx
+  cinemar        # Exportação para CINeMA
 )
 
 # ==============================================================
 #  CONFIGURAÇÃO — edite apenas este bloco
 # ==============================================================
+
 
 SHEETS_URL <- "https://docs.google.com/spreadsheets/d/1A1Lm1nUGtHNgLRp1w4ODA-f4x5QGRerRi2gLD7uxmsM/edit?gid=920639060#gid=920639060"
 BASE_DIR   <- "/Users/davibarbosa/Desktop/EDT X Suplements"
@@ -67,6 +69,21 @@ OTHER_COLOR    <- "#0f203e"
 EDGE_COLOR     <- "#A0A0A0"
 LABEL_COLOR    <- "#2A2A2A"
 KNOWN_ACRONYMS <- character(0)
+
+# ── Exportação CINeMA (cinemar) ────────────────────────────
+#   CINEMA_TITLE : título do projeto dentro do .cnm
+#   CINEMA_ROB   : NULL  → todos os estudos com rob = 1 e indirectness = 1 (Low).
+#                  Ou um data.frame com 1 linha por estudo (nome IGUAL à coluna
+#                  'study' da planilha), valores 1/2/3 ou "Low"/"Some"/"High":
+#                    CINEMA_ROB <- data.frame(
+#                      study        = c("Silva 2020", "Souza 2021"),
+#                      rob          = c("Low", "High"),
+#                      indirectness = c("Low", "Low")
+#                    )
+#                  (Pode vir de uma aba: as.data.frame(read_sheet(ss, sheet = "RoB")))
+#                  RoB/indirectness também podem ser ajustados depois, dentro do CINeMA.
+CINEMA_TITLE <- "EDT_Suplementos"
+CINEMA_ROB   <- NULL
 
 # ==============================================================
 #  Autenticação Google (abre browser na primeira execução)
@@ -521,6 +538,183 @@ fix_disconnected_network <- function(df) {
   )
 }
 
+#
+#  Convenção do cinemar/CINeMA: comparação "A:B" (ordem alfabética via sort())
+#  = efeito de A RELATIVO a B, na escala linear (log-RR para binário, MD para
+#  contínuo). No gemtc, d.A.B = efeito de B relativo a A  →  A vs B = -d.A.B.
+
+# Mapeia RoB/indirectness para o código numérico do CINeMA (1 = low,
+# 2 = some concerns/moderate, 3 = high). Aceita número ou texto.
+cinema_level <- function(x) {
+  if (is.numeric(x)) return(as.integer(x))
+  x <- tolower(trimws(as.character(x)))
+  out <- rep(NA_integer_, length(x))
+  out[x %in% c("1", "low", "baixo")]                                   <- 1L
+  out[x %in% c("2", "some", "some concerns", "moderate", "moderado",
+               "unclear", "algumas preocupacoes")]                     <- 2L
+  out[x %in% c("3", "high", "alto")]                                   <- 3L
+  out
+}
+
+# Monta o data.frame no formato EXIGIDO por cnm_frequentist_block():
+#   long_binary     → study, id, t, r, n, rob, indirectness
+#   long_continuous → study, id, t, y, sd, n, rob, indirectness
+# rob_tbl (opcional): data.frame(study, rob, indirectness) — 1 linha por estudo.
+build_cinema_data <- function(df, data_type, rob_tbl = NULL) {
+  D <- data.frame(
+    study = as.character(df$study),
+    id    = as.character(df$study),
+    t     = as.character(df$treatment),
+    n     = df$sampleSize,
+    stringsAsFactors = FALSE
+  )
+  if (data_type == "binary") {
+    D$r <- df$responders
+  } else {
+    D$y  <- df$mean
+    D$sd <- df[["std.dev"]]
+  }
+  D$rob <- 1L
+  D$indirectness <- 1L
+  missing_studies <- character(0)
+  if (!is.null(rob_tbl) && nrow(rob_tbl) > 0) {
+    rob_tbl$study <- trimws(as.character(rob_tbl$study))
+    idx <- match(D$study, rob_tbl$study)
+    has <- !is.na(idx)
+    D$rob[has]          <- cinema_level(rob_tbl$rob[idx[has]])
+    D$indirectness[has] <- cinema_level(rob_tbl$indirectness[idx[has]])
+    missing_studies <- unique(D$study[!has])
+    if (anyNA(D$rob) || anyNA(D$indirectness))
+      stop("CINEMA_ROB com valor nao reconhecido (use 1/2/3 ou Low/Some/High).")
+  }
+  attr(D, "rob_missing") <- missing_studies
+  D
+}
+
+# Efeitos relativos + ICr 95% + intervalo PREDITIVO 95% a partir das amostras
+# MCMC do gemtc, já na convenção "A:B" do CINeMA.
+# Preditivo: theta_new = d_AB + N(0, sd.d^2) (só no modelo de efeitos aleatórios).
+gemtc_comparisons_cinema <- function(result) {
+  trts <- as.character(result$model$network$treatments$id)
+  all_s <- as.matrix(result$samples)
+  sd_d  <- if ("sd.d" %in% colnames(all_s)) all_s[, "sd.d"] else NULL
+  set.seed(2024)
+  rows <- list()
+  for (i in seq_along(trts)) for (j in seq_along(trts)) {
+    if (j <= i) next
+    pr <- sort(c(trts[i], trts[j]))
+    A <- pr[1]; B <- pr[2]
+    re  <- gemtc::relative.effect(result, t1 = A, t2 = B, preserve.extra = FALSE)
+    dAB <- as.matrix(re$samples)[, paste0("d.", A, ".", B)]
+    eff <- -dAB                                   # A relativo a B
+    ci  <- quantile(eff, c(0.025, 0.5, 0.975), names = FALSE)
+    row <- data.frame(comparison = paste0(A, ":", B),
+                      effect = ci[2], se = sd(eff),
+                      ciLower = ci[1], ciUpper = ci[3],
+                      stringsAsFactors = FALSE)
+    if (!is.null(sd_d) && length(sd_d) == length(eff)) {
+      pred <- eff + rnorm(length(eff), 0, sd_d)
+      pq   <- quantile(pred, c(0.025, 0.975), names = FALSE)
+      row$priLower <- pq[1]; row$priUpper <- pq[2]
+    }
+    rows[[length(rows) + 1L]] <- row
+  }
+  do.call(rbind, rows)
+}
+
+# Converte summary(mtc.nodesplit) → data.frame esperado por cnm_bayesian_block().
+# (O extrator interno do cinemar devolve NULL com o gemtc atual.)
+gemtc_nodesplit_cinema <- function(ns) {
+  if (is.null(ns)) return(NULL)
+  s <- tryCatch(summary(ns), error = function(e) NULL)
+  if (is.null(s) || is.null(s$dir.effect) || nrow(s$dir.effect) == 0) return(NULL)
+  key <- function(d) paste(as.character(d$t1), as.character(d$t2))
+  de <- s$dir.effect; ie <- s$ind.effect; pv <- s$p.value
+  ie <- ie[match(key(de), key(ie)), ]
+  pv <- pv[match(key(de), key(pv)), ]
+  out <- lapply(seq_len(nrow(de)), function(k) {
+    t1 <- as.character(de$t1[k]); t2 <- as.character(de$t2[k])
+    pr <- sort(c(t1, t2))
+    # d.t1.t2 = efeito de t2 relativo a t1. Queremos pr[1] relativo a pr[2].
+    flip <- (t1 == pr[1])
+    tr <- function(pe, l, u) if (flip) c(-pe, -u, -l) else c(pe, l, u)
+    d <- tr(de$pe[k], de$ci.l[k], de$ci.u[k])
+    i <- tr(ie$pe[k], ie$ci.l[k], ie$ci.u[k])
+    data.frame(comparison = paste0(pr[1], ":", pr[2]),
+               directEffect = d[1], directLower = d[2], directUpper = d[3],
+               indirectEffect = i[1], indirectLower = i[2], indirectUpper = i[3],
+               pvalue = pv$p[k], stringsAsFactors = FALSE)
+  })
+  do.call(rbind, out)
+}
+
+# Bloco Bayesiano completo: efeitos/ICr/IPr + tau + DIC + SUCRA + nodesplit.
+build_cinema_bayes_block <- function(result, rank_prob = NULL, ns = NULL) {
+  base  <- cinemar::cnm_bayesian_gemtc(result, ranks = rank_prob)  # tau, DIC, SUCRA
+  comps <- gemtc_comparisons_cinema(result)
+  nsdf  <- gemtc_nodesplit_cinema(ns)
+  sucra_df <- if (!is.null(base$sucra)) do.call(rbind, lapply(base$sucra, function(s)
+    data.frame(treatment = s$treatment, sucra = s$sucra,
+               rankProbabilities = I(list(s$rankProbabilities)),
+               stringsAsFactors = FALSE))) else NULL
+  cinemar::cnm_bayesian_block(comps, tau = base$tau, nodesplit = nsdf,
+                              sucra = sucra_df, dic = base$dic)
+}
+
+# Checagem de orientação: sinais Bayes vs frequentista (netmeta) devem coincidir.
+check_cinema_orientation <- function(freq_block, bayes_block, tol = 0.05) {
+  f <- setNames(vapply(freq_block$frequentist$nmaResults, `[[`, numeric(1), "effect"),
+                vapply(freq_block$frequentist$nmaResults, `[[`, character(1), "comparison"))
+  b <- setNames(vapply(bayes_block$nmaResults, `[[`, numeric(1), "effect"),
+                vapply(bayes_block$nmaResults, `[[`, character(1), "comparison"))
+  cm <- intersect(names(f), names(b))
+  if (!length(cm)) stop("Nenhuma comparacao em comum entre blocos Bayes e frequentista.")
+  ok <- abs(f[cm]) > tol & abs(b[cm]) > tol           # ignora efeitos ~0
+  if (!any(ok)) return(invisible(list(n = 0, agree = NA)))
+  agree <- mean(sign(f[cm][ok]) == sign(b[cm][ok]))
+  if (agree < 0.5)
+    stop(sprintf("Orientacao invertida: so %.0f%% dos sinais Bayes/freq coincidem.", 100 * agree))
+  invisible(list(n = sum(ok), agree = agree))
+}
+
+# CORREÇÃO DE BUG do cinemar 0.1.0: em cnm_frequentist_block() os rótulos do
+# netsplit ("C:B") são normalizados para "B:C" SEM negar direct/indirect/
+# incoherence. Refazemos o mesmo netmeta/netsplit e invertemos o sinal das
+# comparações cujo rótulo original não estava em ordem alfabética.
+fix_cinema_netsplit_orientation <- function(freq_block, cin_data, cinema_type, sm) {
+  if (cinema_type == "long_binary") {
+    P <- meta::pairwise(treat = t, event = r, n = n, data = cin_data,
+                        studlab = id, sm = sm, allstudies = TRUE)
+    nm <- netmeta::netmeta(TE, seTE, treat1, treat2, studlab, data = P, sm = sm,
+                           common = TRUE, random = TRUE)
+  } else {
+    P <- meta::pairwise(treat = t, mean = y, sd = sd, n = n, data = cin_data,
+                        studlab = id, sm = sm)
+    nm <- netmeta::netmeta(TE, seTE, treat1, treat2, studlab, data = P, sm = sm,
+                           common = TRUE, random = TRUE, tol.multiarm = 0.05)
+  }
+  ss <- netmeta::netsplit(nm)
+  lab <- as.character(ss$comparison)
+  rev_comps <- vapply(strsplit(lab, ":", fixed = TRUE), function(p)
+    !identical(p, sort(p)), logical(1))
+  to_flip <- vapply(strsplit(lab[rev_comps], ":", fixed = TRUE),
+                    function(p) paste(sort(p), collapse = ":"), character(1))
+  neg <- function(x) if (is.null(x)) x else
+    modifyList(x, list(effect = -x$effect, ciLower = -x$ciUpper, ciUpper = -x$ciLower))
+  freq_block$frequentist$nmaResults <- lapply(freq_block$frequentist$nmaResults, function(r) {
+    if (r$comparison %in% to_flip) {
+      r$direct <- neg(r$direct); r$indirect <- neg(r$indirect)
+      if (!is.null(r$incoherence)) {
+        r$incoherence <- neg(r$incoherence)
+        r$incoherence$z <- -r$incoherence$z
+      }
+    }
+    r
+  })
+  attr(freq_block, "netsplit_flipped") <- to_flip
+  freq_block
+}
+
 # ── Loop principal ──────────────────────────────────────────
 
 erros  <- list()
@@ -682,6 +876,7 @@ for (sheet in sheet_list) {
     )
     
     # --- 7. Node Splitting -----------------------------------------------
+    ns <- NULL   # evita reaproveitar o nodesplit do desfecho anterior
     tryCatch({
       
       if (data_type == "continuous") {
@@ -777,6 +972,63 @@ for (sheet in sheet_list) {
         file.path(out_dir, "nodesplit_fallback_inconsistency.docx")
       )
       
+    })
+    
+    # --- 8. Exportação para CINeMA (cinemar) -----------------------------
+    #   Bloco frequentista (netmeta, estrutural): matriz de contribuição,
+    #   prop-direct, design-by-treatment, heterogeneidade → domínios RoB,
+    #   indirectness e incoerência do CINeMA.
+    #   Bloco Bayesiano (gemtc, PRIMÁRIO): efeitos, ICr, IPr, tau, DIC,
+    #   SUCRA e nodesplit → league table, imprecisão, heterogeneidade.
+    tryCatch({
+      sm_val      <- if (data_type == "binary") "RR" else "MD"   # = link log / identity do gemtc
+      cinema_type <- if (data_type == "binary") "long_binary" else "long_continuous"
+      
+      # 1. Dados brutos no formato do cinemar (NÃO o objeto netmeta)
+      cin_data <- build_cinema_data(nma_model, data_type, rob_tbl = CINEMA_ROB)
+      if (!is.null(CINEMA_ROB) && length(attr(cin_data, "rob_missing")) > 0) {
+        msg_rob <- paste0("CINeMA: estudos sem RoB/indirectness em CINEMA_ROB (usado 1 = Low): ",
+                          paste(attr(cin_data, "rob_missing"), collapse = ", "))
+        avisos[[paste0(sheet, " [CINeMA]")]] <- msg_rob
+        message("[AVISO] ", msg_rob)
+      }
+      
+      # 2. Bloco frequentista estrutural
+      freq_block <- cnm_frequentist_block(
+        data  = cin_data,
+        type  = cinema_type,
+        sm    = sm_val,
+        model = "random"
+      )
+      freq_block <- fix_cinema_netsplit_orientation(freq_block, cin_data, cinema_type, sm_val)
+      
+      # 3. Bloco Bayesiano (mesmo MCMC das seções 3/6/7)
+      bayes_block <- build_cinema_bayes_block(
+        result    = mcmc_nma,
+        rank_prob = rank_prob,   # seção 6 (já com preferredDirection)
+        ns        = ns           # seção 7 (NULL se nodesplit não foi possível)
+      )
+      
+      # 4. Sanidade: orientação Bayes vs frequentista
+      chk <- check_cinema_orientation(freq_block, bayes_block)
+      message(sprintf("[INFO] CINeMA: orientacao OK (%s comparacoes, %.0f%% sinais concordantes)",
+                      chk$n, 100 * chk$agree))
+      
+      # 5. Montar e gravar o .cnm
+      cinema_obj <- build_cnm(
+        freq     = freq_block,
+        bayesian = bayes_block,
+        title    = CINEMA_TITLE,
+        outcome  = as.character(sheet)
+      )
+      write_cnm(cinema_obj, file = file.path(out_dir, "cinema_project.cnm"))
+      
+      message("[INFO] Arquivo CINeMA gerado: ", file.path(out_dir, "cinema_project.cnm"))
+      
+    }, error = function(e) {
+      msg_cin <- paste0("Falha na exportacao CINeMA: ", conditionMessage(e))
+      avisos[[paste0(sheet, " [CINeMA]")]] <<- msg_cin
+      message("[AVISO] ", sheet, ": ", msg_cin)
     })
     
     TRUE
