@@ -76,11 +76,28 @@ ss <- as_sheets_id(SHEETS_URL)
 
 # ── Funções auxiliares ──────────────────────────────────────
 
+# IMPORTANTE: retornar 1 / -1 como DOUBLE (sem sufixo L).
+# gemtc::rank.probability só inverte o ranking se identical(preferredDirection, -1);
+# identical(-1L, -1) é FALSE, então -1L fazia a direção ser ignorada em silêncio.
 detect_direction <- function(sheet_name) {
-  if (grepl("(+)", sheet_name, fixed = TRUE)) return(1L)
-  if (grepl("(-)", sheet_name, fixed = TRUE)) return(-1L)
+  if (grepl("(+)", sheet_name, fixed = TRUE)) return(1)
+  if (grepl("(-)", sheet_name, fixed = TRUE)) return(-1)
   warning("'", sheet_name, "': aba sem sinal (+/-). Assumindo (-) [lower-is-better].")
-  return(-1L)
+  return(-1)
+}
+
+# Checagem de segurança: o tratamento com maior P(1º lugar) deve coincidir com o
+# melhor tratamento pela mediana do efeito relativo, na direção clínica do desfecho.
+# Divergência => aviso (pode ser empate real ou erro de direção; inspecionar).
+check_rank_direction <- function(mcmc_nma, rank_prob, direction) {
+  trts <- rownames(rank_prob)
+  smp  <- as.matrix(relative.effect(mcmc_nma, trts[1], trts, preserve.extra = FALSE)$samples)
+  med  <- apply(smp, 2, median); names(med) <- trts
+  best_effect <- trts[which.max(direction * med)]
+  best_rank   <- trts[which.max(rank_prob[, 1])]
+  list(ok = identical(best_effect, best_rank),
+       msg = sprintf("Melhor pelo efeito (mediana) = %s; melhor pelo ranking (P 1º) = %s",
+                     best_effect, best_rank))
 }
 
 safe_name <- function(x) trimws(gsub("[^[:alnum:] _\\-]", "", x))
@@ -118,14 +135,14 @@ clean_validate <- function(df, sheet) {
   miss <- setdiff(need, names(df))
   if (length(miss) > 0)
     stop("Colunas ausentes: ", paste(miss, collapse = ", "))
-
+  
   df$study      <- as.character(unlist(df$study))
   df$treatment  <- as.character(unlist(df$treatment))
   df$responders <- suppressWarnings(as.numeric(unlist(df$responders)))
   df$sampleSize <- suppressWarnings(as.numeric(unlist(df$sampleSize)))
-
+  
   notes <- character(0)
-
+  
   dup_exact <- duplicated(df[, c("study", "treatment", "responders", "sampleSize")])
   if (any(dup_exact)) {
     notes <- c(notes, sprintf("Removidas %d linha(s) duplicada(s) exata(s).", sum(dup_exact)))
@@ -135,17 +152,17 @@ clean_validate <- function(df, sheet) {
   if (any(duplicated(key)))
     stop("Conflito de dados: study×treatment repetido com valores divergentes -> ",
          paste(unique(key[duplicated(key)]), collapse = "; "))
-
+  
   bad <- is.na(df$responders) | is.na(df$sampleSize) |
     df$sampleSize <= 0 | df$responders < 0 | df$responders > df$sampleSize
   if (any(bad))
     stop("Linhas inválidas (NA / n<=0 / responders>sampleSize): ",
          paste(which(bad), collapse = ", "))
-
+  
   n_zero <- sum(df$responders == 0)
   if (n_zero > 0)
     notes <- c(notes, sprintf("%d braço(s) com zero eventos (sem correção de continuidade no modelo bayesiano).", n_zero))
-
+  
   list(data = df, notes = notes)
 }
 
@@ -180,17 +197,17 @@ plot_nma_network_custom <- function(
     edge_color = EDGE_COLOR, label_color = LABEL_COLOR,
     known_acronyms = KNOWN_ACRONYMS,
     canvas_in = CANVAS_IN, label_scale = LABEL_SCALE) {
-
+  
   s <- canvas_in / REF_CANVAS
   max_node_size <- 40.0 * s; min_node_size <- 1.5 * s
   label_size <- 8.5 * s * label_scale
   edge_max <- 11.0 * s; edge_min <- 2.2 * s
   label_gap <- 0.08; margin_pt <- round(55 * s)
   coord_range <- 2.52; mm_per_coord <- canvas_in * 25.4 / coord_range
-
+  
   trt_n <- aggregate(nma_df$sampleSize, by = list(treatment = nma_df$treatment), FUN = sum)
   names(trt_n)[2] <- "total_n"; trt_n$treatment <- as.character(trt_n$treatment)
-
+  
   pairs_list <- lapply(unique(nma_df$study), function(s_id) {
     trts <- sort(unique(as.character(nma_df$treatment[nma_df$study == s_id])))
     if (length(trts) < 2) return(NULL)
@@ -202,12 +219,12 @@ plot_nma_network_custom <- function(
                            by = list(t1 = all_pairs$t1, t2 = all_pairs$t2), FUN = sum)
   names(edge_counts)[3] <- "n_studies"
   edge_counts$t1 <- as.character(edge_counts$t1); edge_counts$t2 <- as.character(edge_counts$t2)
-
+  
   trts <- sort(unique(as.character(nma_df$treatment))); n_t <- length(trts)
   angles <- seq(0, 2 * pi * (1 - 1 / n_t), length.out = n_t)
   ref_idx <- which(trts == ref_treatment)
   if (length(ref_idx) > 0) { shift <- (3 * pi / 2) - angles[ref_idx]; angles <- (angles + shift) %% (2 * pi) }
-
+  
   nodes <- data.frame(treatment = trts, angle = angles,
                       x = cos(angles), y = sin(angles), stringsAsFactors = FALSE)
   nodes <- merge(nodes, trt_n, by = "treatment")
@@ -215,19 +232,19 @@ plot_nma_network_custom <- function(
   nodes$label_full <- paste0(vapply(nodes$label, wrap_label, character(1), width = 14),
                              "\n(n = ", formatC(nodes$total_n, format = "d", big.mark = ","), ")")
   nodes$fill <- ifelse(nodes$treatment == ref_treatment, ref_color, other_color)
-
+  
   n_max <- max(nodes$total_n)
   nodes$node_r_coord <- (max_node_size / 2) * sqrt(nodes$total_n / n_max) / mm_per_coord
   nodes$label_r <- 1 + nodes$node_r_coord + label_gap
   nodes$lx <- cos(nodes$angle) * nodes$label_r; nodes$ly <- sin(nodes$angle) * nodes$label_r
   nodes$hjust <- ifelse(cos(nodes$angle) < -0.1, 1, ifelse(cos(nodes$angle) > 0.1, 0, 0.5))
   nodes$vjust <- ifelse(sin(nodes$angle) >  0.1, 0, ifelse(sin(nodes$angle) < -0.1, 1, 0.5))
-
+  
   edges <- merge(edge_counts, nodes[, c("treatment", "x", "y")], by.x = "t1", by.y = "treatment")
   names(edges)[4:5] <- c("x1", "y1")
   edges <- merge(edges, nodes[, c("treatment", "x", "y")], by.x = "t2", by.y = "treatment")
   names(edges)[6:7] <- c("x2", "y2")
-
+  
   ggplot() +
     geom_segment(data = edges, aes(x = x1, y = y1, xend = x2, yend = y2, linewidth = n_studies),
                  color = edge_color, alpha = 0.70, lineend = "round") +
@@ -357,85 +374,92 @@ link_of <- function(m) if (m == "OR") "logit" else "log"
 sheet_list <- if (length(SHEET_LIST) > 0) SHEET_LIST else googlesheets4::sheet_names(ss)
 
 for (sheet in sheet_list) {
-
+  
   cat("\n======================================================\n")
   cat(">>> Desfecho:", sheet, "\n")
   cat("======================================================\n")
-
+  
   sucesso <- tryCatch({
-
+    
     out_dir <- file.path(BASE_DIR, safe_name(sheet))
     dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-
+    
     raw <- read_sheet(ss, sheet = sheet)
     cv  <- clean_validate(raw, sheet); nma_df <- cv$data
     sheet_notes <- cv$notes
-
+    
     net_check <- fix_disconnected_network(nma_df); nma_df <- net_check$data
     if (net_check$disconnected) {
       msg <- paste0("Rede podada p/ maior componente. Removidos: ",
                     paste(net_check$trts_dropped, collapse = ", "))
       avisos[[sheet]] <- msg; sheet_notes <- c(sheet_notes, msg); message("[AVISO] ", sheet, ": ", msg)
     }
-
+    
     direction <- detect_direction(sheet)
-
+    
     # --- Referência dinâmica -------------------------------------------
     refsel <- choose_reference(nma_df); ref <- refsel$ref
     message("[INFO] Referência (mais frequente): ", ref, " | ", refsel$rationale)
     trt_order <- c(ref, setdiff(sort(unique(nma_df$treatment)), ref))
-
+    
     # --- Rede + plot ---------------------------------------------------
     nma_net <- mtc.network(data.ab = nma_df, treatments = trt_order,
                            description = paste("NMA -", sheet))
     save_fig_gg(plot_nma_network_custom(nma_df, ref_treatment = ref),
                 file.path(out_dir, "network_plot"))
-
+    
     # --- Modelo bayesiano RR (MCMC alto) -------------------------------
     measure  <- EFFECT_MEASURE
     mcmc_nma <- run_bayes(nma_net, link_of(measure), MCMC)
-
+    
     # Diagnóstico (reportado, sem gate)
     gelman_d <- gelman.diag(mcmc_nma, multivariate = FALSE)
     psrf_max <- max(gelman_d$psrf[, "Point est."], na.rm = TRUE)
     if (psrf_max > 1.05)
       sheet_notes <- c(sheet_notes, sprintf("PSRF max = %.3f (>1.05) — inspecionar trace/gelman.", psrf_max))
-
+    
     mcmc_sum <- summary(mcmc_nma)
     exp_scale <- TRUE   # binário -> exponencia (RR)
-
+    
     save_fig(function() plot(mcmc_nma), file.path(out_dir, "trace_plot"), width = 14, height = 10)
     save_fig(function() gelman.plot(mcmc_nma, autoburnin = FALSE), file.path(out_dir, "gelman_plot"))
-
+    
     # τ (heterogeneidade) e DIC
     tau_row <- tryCatch(mcmc_sum$summaries$statistics["sd.d", , drop = FALSE], error = function(e) NULL)
     dic_val <- tryCatch(mcmc_sum$DIC, error = function(e) NULL)
-
+    
     save_docx(list(
       list(heading = paste("MCMC Summary -", sheet, "(RR; ICr 95%)"), content = mcmc_sum),
       list(heading = "Heterogeneidade (sd.d = tau)", content = if (is.null(tau_row)) "n/d" else tau_row),
       list(heading = "DIC / model fit", content = if (is.null(dic_val)) "n/d" else dic_val),
       list(heading = "Gelman-Rubin (PSRF)", content = gelman_d)
     ), file.path(out_dir, "mcmc_summary.docx"))
-
+    
     # --- League table + efeitos vs referência (ICr 95%) ----------------
     write.xlsx(build_league(mcmc_nma, exp_scale),
                file.path(out_dir, "league_table.xlsx"), rowNames = TRUE)
     write.xlsx(ref_effects_table(mcmc_nma, ref, exp_scale),
                file.path(out_dir, paste0("effects_vs_", safe_name(ref), ".xlsx")), rowNames = FALSE)
-
+    
     # --- Ranking + SUCRA (direção aplicada UMA vez) --------------------
-    rank_prob <- rank.probability(mcmc_nma, preferredDirection = direction)
-    sucra_res <- sucra(rank_prob, lower.is.better = FALSE)
+    rank_prob <- rank.probability(mcmc_nma, preferredDirection = as.numeric(direction))
+    sucra_res <- sucra(rank_prob, lower.is.better = FALSE)   # direção já aplicada acima
+    
+    rk_chk <- check_rank_direction(mcmc_nma, rank_prob, direction)
+    if (!rk_chk$ok) {
+      msg <- paste0("CHECAR DIREÇÃO DO RANKING: ", rk_chk$msg)
+      avisos[[sheet]] <- msg; sheet_notes <- c(sheet_notes, msg)
+      message("[AVISO] ", sheet, ": ", msg)
+    }
     save_docx(list(
       list(heading = "Rank Probability", content = rank_prob),
       list(heading = "SUCRA", content = sucra_res)
     ), file.path(out_dir, "rank_sucra.docx"))
-
+    
     # --- Inconsistência: node splitting só se houver loop fechado ------
     splits <- tryCatch(mtc.nodesplit.comparisons(nma_net), error = function(e) NULL)
     has_loop <- !is.null(splits) && nrow(as.data.frame(splits)) > 0
-
+    
     if (has_loop) {
       ns <- mtc.nodesplit(nma_net, linearModel = "random", likelihood = "binom",
                           link = link_of(measure),
@@ -455,7 +479,7 @@ for (sheet in sheet_list) {
                 file.path(out_dir, "nodesplit_fallback_inconsistency.docx"))
       sheet_notes <- c(sheet_notes, "Sem loop fechado; inconsistência via decomp.design (frequentista).")
     }
-
+    
     # --- Linha do relatório final --------------------------------------
     cnt <- refsel$table
     counts_str <- paste(sprintf("%s=%d(N%s)", cnt$treatment, cnt$n_studies,
@@ -495,10 +519,10 @@ for (sheet in sheet_list) {
 # ==============================================================
 if (length(report_rows) > 0) {
   report_df <- do.call(rbind, report_rows); rownames(report_df) <- NULL
-
+  
   write.xlsx(report_df, file.path(BASE_DIR, "_RELATORIO_referencias.xlsx"))
   write.csv(report_df, file.path(BASE_DIR, "_RELATORIO_referencias.csv"), row.names = FALSE)
-
+  
   ft <- autofit(flextable(report_df))
   doc <- read_docx()
   doc <- body_add_par(doc, "Relatório de referências adotadas por desfecho", style = "heading 1")
@@ -509,7 +533,7 @@ if (length(report_rows) > 0) {
   doc <- body_add_par(doc, "", style = "Normal")
   doc <- body_add_flextable(doc, ft)
   print(doc, target = file.path(BASE_DIR, "_RELATORIO_referencias.docx"))
-
+  
   cat("\n>>> Relatório final salvo em: ", file.path(BASE_DIR, "_RELATORIO_referencias.{xlsx,csv,docx}"), "\n")
 }
 
