@@ -3,10 +3,11 @@
 #          Atendimentos ambulatoriais (SIASUS) e tratamento no Componente
 #          Especializado da Assistência Farmacêutica (CEAF), 2015–2025
 #
-# Fontes (SIASUS/DATASUS, ftp.datasus.gov.br/dissemin/publicos/SIASUS/200801_/Dados):
+# Fontes (DATASUS, ftp.datasus.gov.br/dissemin/publicos/{SIASUS,SIHSUS}/200801_/Dados):
 #   PAALaamm.dbc — Produção Ambulatorial (fluxograma, APAC, quantidades)
 #   BIALaamm.dbc — BPA Individualizado (CNS, data de nascimento) → atendimentos
 #   AMALaamm.dbc — APAC de Medicamentos (CEAF: CNS, medicamento, peso, altura)
+#   RDALaamm.dbc — SIH, AIH reduzida (internações; sem CNS nos arquivos públicos)
 # População: estimativas DATASUS 2024 por município, sexo e faixa etária
 #   (pacote brpop; 2025 = 2024 repetido).
 # Documentação: Informe Técnico SIASUS (jul/2019) e PCDT de Asma.
@@ -41,6 +42,7 @@
 #      (quantidade dispensada × µg por unidade ÷ 30), classificada pela GINA
 #      por idade. A apresentação (200 × 400 µg) é descrita à parte.
 #  [13][14] Episódio = paciente × medicamento, quebrado por lacuna ≥ 3 meses
+#      (CEAF: entrada aos 0–19 anos, seguimento até 20 — margem de 1 ano)
 #      observáveis; persistência por Kaplan-Meier.
 #  [10] Vínculo BI × AM com regressão logística ajustada; antes × depois em
 #      janelas múltiplas + grupo controle pareado (diferença-em-diferenças).
@@ -68,6 +70,7 @@ cod_uf_al   <- "27"
 cod_maceio  <- "270430"
 idade_max   <- 110                # acima disso: idade implausível → NA
 idade_ped   <- 19                 # recorte: 0–19 anos
+margem_idade <- 1                 # CEAF: quem entra até 19 anos é seguido até 20
 idade_eca   <- 17                 # sensibilidade: 0–17 anos
 idade_min_sensibilidade <- 5      # sensibilidade: 5–19 anos
 min_registros_mun <- 30           # mínimo por município (estabilidade)
@@ -282,30 +285,37 @@ periodos <- format(seq(as.Date(sprintf("%d-01-01", min(anos))), by = "month",
 
 # Lista os arquivos (inclui partes a, b, c...). Sem a pasta montada, lista o
 # diretório do FTP; se a listagem falhar, monta os nomes sem partes. [20]
-listar_arquivos <- function(prefixo) {
+listar_arquivos <- function(prefixo, url = url_ftp, pasta = dir_dbc) {
   padrao <- sprintf("^%sAL(%s)[a-z]?\\.dbc$", prefixo, paste(periodos, collapse = "|"))
-  if (dir.exists(dir_dbc))
-    return(list.files(dir_dbc, pattern = padrao, full.names = TRUE, ignore.case = TRUE))
-  nomes <- tryCatch(strsplit(RCurl::getURL(url_ftp, dirlistonly = TRUE,
+  if (!is.null(pasta) && dir.exists(pasta))
+    return(list.files(pasta, pattern = padrao, full.names = TRUE, ignore.case = TRUE))
+  nomes <- tryCatch(strsplit(RCurl::getURL(url, dirlistonly = TRUE,
                                            ftp.use.epsv = FALSE), "\r?\n")[[1]],
                     error = function(e) NULL)
-  if (!is.null(nomes)) return(paste0(url_ftp, grep(padrao, nomes, value = TRUE, ignore.case = TRUE)))
-  paste0(url_ftp, prefixo, "AL", periodos, ".dbc")
+  if (!is.null(nomes)) return(paste0(url, grep(padrao, nomes, value = TRUE, ignore.case = TRUE)))
+  paste0(url, prefixo, "AL", periodos, ".dbc")
 }
 
-ler_dbc <- function(caminho) {
+# O FTP do DATASUS recusa muitas conexões de dados: até 6 tentativas
+ler_dbc <- function(caminho, tentativas = 6) {
   if (file.exists(caminho)) return(read.dbc(caminho, as.is = TRUE))
   tmp <- tempfile(fileext = ".dbc")
   on.exit(unlink(tmp))
-  download.file(caminho, tmp, mode = "wb", quiet = TRUE)
-  read.dbc(tmp, as.is = TRUE)
+  for (i in seq_len(tentativas)) {
+    ok <- tryCatch({ download.file(caminho, tmp, mode = "wb", quiet = TRUE); TRUE },
+                   error = function(e) e, warning = function(w) w)
+    if (isTRUE(ok) && file.exists(tmp) && file.size(tmp) > 0) return(read.dbc(tmp, as.is = TRUE))
+    if (inherits(ok, "condition") && grepl("550|unavailable", conditionMessage(ok))) break
+    Sys.sleep(3)
+  }
+  stop("download falhou após ", tentativas, " tentativas")
 }
 
 arquivos_falha <- tibble(Arquivo = character(), Motivo = character())
 
-extrair <- function(prefixo, dir_cache, cols, cid_cols) {
+extrair <- function(prefixo, dir_cache, cols, cid_cols, url = url_ftp, pasta = dir_dbc) {
   verificar_cache(dir_cache, cols, cid_cols)
-  arquivos <- listar_arquivos(prefixo)
+  arquivos <- listar_arquivos(prefixo, url, pasta)
   message(prefixo, ": ", length(arquivos), " arquivos")
   for (f in arquivos) {
     cache <- file.path(dir_cache, sub("\\.dbc$", ".rds", basename(f), ignore.case = TRUE))
@@ -325,6 +335,19 @@ extrair <- function(prefixo, dir_cache, cols, cid_cols) {
 pa_raw <- extrair("PA", file.path(output_dir, "cache_asma_PA"), cols_pa, c("PA_CIDPRI", "PA_CIDSEC"))
 bi_raw <- extrair("BI", file.path(output_dir, "cache_asma_BI"), cols_bi, "CIDPRI")
 am_raw <- extrair("AM", file.path(output_dir, "cache_asma_AM"), cols_am, c("AP_CIDPRI", "AP_CIDSEC"))
+
+# SIH/RD — internações (AIH reduzida). Guarda asma em qualquer posição do CID;
+# a definição de caso (CID principal) é aplicada depois.
+url_ftp_sih <- "ftp://ftp.datasus.gov.br/dissemin/publicos/SIHSUS/200801_/Dados/"
+dir_dbc_sih <- "/Volumes/ftp.datasus.gov.br/dissemin/publicos/SIHSUS/200801_/Dados"
+cols_sih <- c("ANO_CMPT", "MES_CMPT", "N_AIH", "IDENT", "CEP", "MUNIC_RES", "MUNIC_MOV",
+              "NASC", "SEXO", "RACA_COR", "IDADE", "COD_IDADE", "DT_INTER", "DT_SAIDA",
+              "DIAS_PERM", "UTI_MES_TO", "MARCA_UTI", "MORTE", "CAR_INT", "COBRANCA",
+              "PROC_REA", "CNES", "DIAG_PRINC", "DIAG_SECUN", paste0("DIAGSEC", 1:9),
+              "CID_MORTE", "VAL_TOT")
+sih_raw <- extrair("RD", file.path(output_dir, "cache_asma_SIH"), cols_sih,
+                   c("DIAG_PRINC", "DIAG_SECUN", paste0("DIAGSEC", 1:9)),
+                   url = url_ftp_sih, pasta = dir_dbc_sih)
 
 # --- Tabela SIGTAP -------------------------------------------------------------
 carregar_sigtap <- function() {
@@ -698,8 +721,8 @@ if (!is.null(pop_ped)) {
 }
 
 # Variação percentual anual (APC) por Prais-Winsten sobre log(taxa) [9]
-apc_prais <- function(df, var, nome, excluir_covid = FALSE) {
-  d <- df %>% filter(Ano %in% anos_tend, !is.na(.data[[var]]), .data[[var]] > 0)
+apc_prais <- function(df, var, nome, excluir_covid = FALSE, periodo_anos = anos_tend) {
+  d <- df %>% filter(Ano %in% periodo_anos, !is.na(.data[[var]]), .data[[var]] > 0)
   if (excluir_covid) d <- d %>% filter(!Ano %in% anos_covid)
   if (nrow(d) < 5) return(NULL)
   d$y <- log10(d[[var]]); d$id <- 1L
@@ -828,13 +851,21 @@ am_todas <- am3 %>%
   left_join(qtd_med, by = c("AP_AUTORIZ", "AP_CMP", "AP_PRIPAL"))
 
 am4 <- am_todas %>% filter(CNS_OK)
-am5 <- am4 %>% filter(!is.na(Idade), Idade <= idade_ped)
+# Entrada: paciente com 1ª APAC do período aos 0–19 anos. Seguimento: até
+# idade_ped + margem_idade (quem entra aos 19 e faz 20 durante o tratamento
+# continua sendo acompanhado; o corte por idade só ocorre aos 21).
+cns_entrada_ped <- am4 %>% filter(!is.na(Idade)) %>% group_by(AP_CNSPCN) %>%
+  summarise(Idade_Entrada = Idade[which.min(Mes)], .groups = "drop") %>%
+  filter(Idade_Entrada <= idade_ped) %>% pull(AP_CNSPCN)
+am5 <- am4 %>% filter(AP_CNSPCN %in% cns_entrada_ped, !is.na(Idade),
+                      Idade <= idade_ped + margem_idade)
 am6 <- am5 %>% filter(Mes <= mes_fim_valido)
 
 fluxo_am <- tibble(
   Etapa = c("Registros AM com CID J45/J46", "Competência no período", "Residente em AL",
             "Sem duplicatas (AUTORIZ × CMP × medicamento)", "CNS válido",
-            sprintf("Idade 0–%d anos na competência", idade_ped),
+            sprintf("Entrada aos 0–%d anos; seguimento até %d anos (margem de %d ano)",
+                    idade_ped, idade_ped + margem_idade, margem_idade),
             sprintf("Até o fim dos dados completos (%s)", format(idx_data(mes_fim_valido), "%m/%Y"))),
   Linhas = c(nrow(am0), nrow(am1), nrow(am2), nrow(am3), nrow(am4), nrow(am5), nrow(am6))) %>%
   mutate(Excluidas = lag(Linhas) - Linhas)
@@ -856,7 +887,11 @@ am <- am6 %>%
   mutate(Sexo     = decod_sexo(AP_SEXO),
          Raca_Cor = decod_raca(AP_RACACOR),
          Local    = if_else(Mun_Res == cod_maceio, "Maceió", "Interior"),
-         Faixa_Etaria = faixa_ped(Idade),
+         Margem   = Idade > idade_ped,
+         Faixa_Etaria = if_else(Margem, sprintf("%d (margem de seguimento)", idade_ped + 1),
+                                as.character(faixa_ped(Idade))),
+         Faixa_Etaria = factor(Faixa_Etaria, levels = c(niveis_faixa,
+                               sprintf("%d (margem de seguimento)", idade_ped + 1), "Ignorada")),
          Peso     = suppressWarnings(as.numeric(AM_PESO)),
          Peso     = if_else(between(Peso, faixa_peso[1], faixa_peso[2]), Peso, NA_real_),
          Altura   = suppressWarnings(as.numeric(AM_ALTURA)),
@@ -909,7 +944,10 @@ completude_am <- am %>%
 # Paciente novo (washout): sem APAC (qualquer idade) nos 12 meses anteriores [6]
 primeira_apac <- am_todas %>% filter(CNS_OK) %>% group_by(AP_CNSPCN) %>% summarise(Mes_1a_APAC = min(Mes))
 
+# Características do paciente: só meses aos 0–19 anos (a margem vale só para
+# o seguimento dos episódios de tratamento)
 pacientes_am <- am %>%
+  filter(!Margem) %>%
   arrange(AP_CNSPCN, Mes) %>%
   group_by(AP_CNSPCN) %>%
   summarise(
@@ -961,7 +999,9 @@ resumo_am <- pacientes_am %>%
                                        pmax(N_Com_IMC_Valido, 1) * 100, 2))
 
 # Produção por ano: todas as APAC × só aprovadas (o filtro antigo) [1]
+# Só meses aos 0–19 anos: é o numerador das taxas por habitante de 0–19
 pacientes_am_ano <- am %>%
+  filter(!Margem) %>%
   group_by(Ano) %>%
   summarise(Pacientes_Todas_APAC = n_distinct(AP_CNSPCN),
             Pacientes_So_Aprovadas = n_distinct(AP_CNSPCN[Aprovada]),
@@ -1002,8 +1042,9 @@ testes_tratamento <- bind_rows(lapply(vars_perfil_am, function(v)
 # 7b. EPISÓDIOS, PERSISTÊNCIA (KAPLAN-MEIER) E DESFECHO DO TRATAMENTO [1][13][14]
 #   Episódio = paciente × medicamento; lacuna ≥ gap_meses meses OBSERVÁVEIS sem
 #   APAC abre novo episódio. Meses suspeitos (queda abrupta de volume) não
-#   contam como lacuna. Desfecho (hierárquico): óbito > completou 20 anos e
-#   seguiu no CEAF adulto > troca de medicamento até gap_meses após o fim >
+#   contam como lacuna. Desfecho (hierárquico): óbito > atingiu o limite de
+#   idade do seguimento (21 anos, com a margem) e seguiu no CEAF > troca de
+#   medicamento até gap_meses após o fim >
 #   em uso no fim dos dados > saída registrada > interrompeu.
 # ------------------------------------------------------------------------------
 meses_todos <- seq(min(am3$Mes), mes_fim_valido)
@@ -1012,11 +1053,11 @@ meses_obs_entre <- function(m1, m2) {           # meses observáveis estritament
   as.integer(obs_cum[as.character(m2 - 1)] - obs_cum[as.character(m1)])
 }
 
-# Registros adultos (≥ 20 anos) dos mesmos CNS: para detectar transição de idade
-adulto <- am_todas %>% filter(CNS_OK, !is.na(Idade), Idade > idade_ped, Mes <= mes_fim_valido) %>%
-  distinct(AP_CNSPCN, Mes)
-
-construir_episodios <- function(df) {
+# idade_limite = última idade acompanhada; registros acima dela (mesmos CNS)
+# indicam que o tratamento continuou, só que fora do seguimento.
+construir_episodios <- function(df, idade_limite = idade_ped + margem_idade) {
+  adulto <- am_todas %>% filter(CNS_OK, !is.na(Idade), Idade > idade_limite, Mes <= mes_fim_valido) %>%
+    distinct(AP_CNSPCN, Mes)
   base <- df %>%
     distinct(AP_CNSPCN, AP_PRIPAL, Apresentacao, Ug_Bud, Mes, .keep_all = TRUE) %>%
     arrange(AP_CNSPCN, AP_PRIPAL, Mes) %>%
@@ -1048,7 +1089,7 @@ construir_episodios <- function(df) {
       Virou_Adulto = coalesce(Virou_Adulto, FALSE),
       Desfecho = case_when(
         Obito                                         ~ "Óbito registrado",
-        Virou_Adulto                                  ~ "Completou 20 anos (segue no CEAF adulto)",
+        Virou_Adulto                                  ~ "Atingiu o limite de idade do seguimento (segue no CEAF)",
         !is.na(Classe2) & Classe2 == "Imunobiológico" ~ "Trocou para imunobiológico",
         !is.na(Classe2) & coalesce(Ug2 > Ug_Bud, FALSE) ~ "Trocou para cápsula de maior dose",
         !is.na(Classe2) & coalesce(Ug2 < Ug_Bud, FALSE) ~ "Trocou para cápsula de menor dose",
@@ -1057,17 +1098,23 @@ construir_episodios <- function(df) {
         Saida                                         ~ "Saída registrada (encerramento/transferência)",
         TRUE                                          ~ "Interrompeu (≥ 3 meses sem dispensação)"),
       Meses_Seguimento = Fim - Ini + 1,
-      Evento_Interrupcao = Desfecho == "Interrompeu (≥ 3 meses sem dispensação)")
+      Evento_Interrupcao = Desfecho == "Interrompeu (≥ 3 meses sem dispensação)") %>%
+    # Margem só prolonga episódios iniciados até 19 anos; episódio que começa
+    # na margem (20 anos) é início de tratamento adulto e sai da análise
+    filter(Idade_Ini <= idade_ped)
 }
 
 niveis_desfecho <- c("Em uso no fim dos dados", "Trocou para cápsula de maior dose",
                      "Trocou para imunobiológico", "Trocou para cápsula de menor dose",
-                     "Trocou (outro medicamento)", "Completou 20 anos (segue no CEAF adulto)",
+                     "Trocou (outro medicamento)", "Atingiu o limite de idade do seguimento (segue no CEAF)",
                      "Saída registrada (encerramento/transferência)",
                      "Interrompeu (≥ 3 meses sem dispensação)", "Óbito registrado")
 
 episodios <- construir_episodios(am) %>% mutate(Desfecho = factor(Desfecho, levels = niveis_desfecho))
 episodios_aprov <- construir_episodios(am %>% filter(Aprovada)) %>%
+  mutate(Desfecho = factor(Desfecho, levels = niveis_desfecho))
+# Sensibilidade: sem a margem (seguimento cortado aos 20 anos, versão anterior)
+episodios_sem_margem <- construir_episodios(am %>% filter(!Margem), idade_limite = idade_ped) %>%
   mutate(Desfecho = factor(Desfecho, levels = niveis_desfecho))
 
 resumir_desfecho <- function(ep, rotulo) ep %>%
@@ -1079,8 +1126,10 @@ resumir_desfecho <- function(ep, rotulo) ep %>%
 desfecho_medicamento <- resumir_desfecho(episodios, "Todas as APAC (principal)")
 desfecho_sensibilidade <- bind_rows(
   desfecho_medicamento,
-  resumir_desfecho(episodios_aprov, "Só APAC aprovadas (sensibilidade)")) %>%
-  filter(Desfecho %in% c("Em uso no fim dos dados", "Interrompeu (≥ 3 meses sem dispensação)")) %>%
+  resumir_desfecho(episodios_aprov, "Só APAC aprovadas (sensibilidade)"),
+  resumir_desfecho(episodios_sem_margem, sprintf("Sem margem: seguimento só até %d anos", idade_ped))) %>%
+  filter(Desfecho %in% c("Em uso no fim dos dados", "Interrompeu (≥ 3 meses sem dispensação)",
+                         "Atingiu o limite de idade do seguimento (segue no CEAF)")) %>%
   select(Base, Apresentacao, Desfecho, Episodios, Pct)
 
 motivo_saida_am <- am %>%
@@ -1255,6 +1304,185 @@ did_modelo <- tryCatch({
                               Casos = nrow(casos_did), Controles = nrow(controles)))
 
 # ==============================================================================
+# 9b. INTERNAÇÕES POR ASMA (SIH/RD) — 0–19 ANOS
+#   Caso: AIH com CID PRINCIPAL J45/J46 (definição usual de internação por asma
+#   e da lista de condições sensíveis à atenção primária, Portaria SAS 221/2008).
+#   Ano = data de internação. AIH de continuação (IDENT = 5) e reapresentações
+#   (mesmo N_AIH) excluídas. Só arquivos de AL: residentes internados em outros
+#   estados não entram.
+#   Reinternação: os arquivos públicos não têm CNS. Usa-se uma chave
+#   determinística (data de nascimento + sexo + CEP + município de residência).
+#   Duas AIH da mesma chave com nova internação até 1 dia após a alta anterior
+#   são o mesmo episódio (transferência/continuidade). A versão sem CEP serve
+#   de limite superior (mais falsos vínculos).
+# ==============================================================================
+decod_sexo_sih <- function(x) case_when(x == "1" ~ "Masculino", x %in% c("2", "3") ~ "Feminino",
+                                        TRUE ~ "Ignorado")
+desfecho_aih <- function(cob, morte) case_when(
+  morte == "1" | substr(cob, 1, 1) == "4" ~ "Óbito",
+  substr(cob, 1, 1) == "1"                ~ "Alta",
+  substr(cob, 1, 1) == "3"                ~ "Transferência",
+  substr(cob, 1, 1) == "2"                ~ "Permanência (AIH seguinte)",
+  TRUE                                    ~ "Outro/encerramento")
+
+sih0 <- sih_raw %>% as_tibble() %>%
+  mutate(Data_Inter = as.Date(DT_INTER, "%Y%m%d"), Data_Saida = as.Date(DT_SAIDA, "%Y%m%d"),
+         Data_Nasc = as.Date(NASC, "%Y%m%d"), Ano = as.integer(format(Data_Inter, "%Y")),
+         Cmpt = paste0(ANO_CMPT, MES_CMPT))
+sih1 <- sih0 %>% filter(Ano %in% anos)
+sih2 <- sih1 %>% filter(substr(MUNIC_RES, 1, 2) == cod_uf_al)
+sih3 <- sih2 %>% filter(IDENT != "5")
+sih4 <- sih3 %>% arrange(N_AIH, desc(Cmpt)) %>% distinct(N_AIH, .keep_all = TRUE)
+sih5 <- sih4 %>% filter(grepl(regex_asma, DIAG_PRINC))
+sih5 <- sih5 %>%
+  mutate(Idade = floor(as.numeric(Data_Inter - Data_Nasc) / 365.25),
+         Idade_Campo = case_when(COD_IDADE == "4" ~ as.numeric(IDADE),
+                                 COD_IDADE == "5" ~ 100 + as.numeric(IDADE),
+                                 COD_IDADE %in% c("2", "3") ~ 0, TRUE ~ NA_real_),
+         Idade = if_else(is.na(Idade) | Idade < 0 | Idade > idade_max, Idade_Campo, Idade))
+sih6 <- sih5 %>% filter(!is.na(Idade), Idade <= idade_ped)
+
+fluxo_sih <- tibble(
+  Etapa = c("AIH com J45/J46 em qualquer diagnóstico", sprintf("Internação em %d–%d", min(anos), max(anos)),
+            "Residente em AL", "Exclui AIH de continuação (IDENT = 5)",
+            "Exclui reapresentação (N_AIH repetido)", "CID principal J45/J46",
+            sprintf("Idade 0–%d anos", idade_ped)),
+  Linhas = c(nrow(sih0), nrow(sih1), nrow(sih2), nrow(sih3), nrow(sih4), nrow(sih5), nrow(sih6))) %>%
+  mutate(Excluidas = lag(Linhas) - Linhas)
+
+# Asma só como diagnóstico secundário (descritivo, não entra na definição)
+sih_asma_secundaria <- sih4 %>%
+  filter(!grepl(regex_asma, DIAG_PRINC)) %>%
+  mutate(Idade = floor(as.numeric(Data_Inter - Data_Nasc) / 365.25)) %>%
+  filter(!is.na(Idade), Idade <= idade_ped) %>%
+  count(Capitulo_CID_Principal = substr(DIAG_PRINC, 1, 1), name = "AIH") %>%
+  arrange(desc(AIH))
+
+intern <- sih6 %>%
+  mutate(Sexo = decod_sexo_sih(SEXO), Raca_Cor = decod_raca(RACA_COR),
+         Faixa_Etaria = faixa_ped(Idade),
+         Mun_Res = substr(MUNIC_RES, 1, 6),
+         Local = if_else(Mun_Res == cod_maceio, "Maceió", "Interior"),
+         Fora_Municipio = substr(MUNIC_MOV, 1, 6) != Mun_Res,
+         CID_Asma = cid_asma(DIAG_PRINC),
+         Carater = decod_carater(CAR_INT),
+         Dias = suppressWarnings(as.numeric(DIAS_PERM)),
+         UTI = coalesce(suppressWarnings(as.numeric(UTI_MES_TO)), 0) > 0 |
+               !MARCA_UTI %in% c("", "00", NA),
+         Desfecho = desfecho_aih(COBRANCA, MORTE),
+         Obito = Desfecho == "Óbito",
+         Mes_Inter = mes_idx(format(Data_Inter, "%Y%m")),
+         Covid = Ano %in% anos_covid,
+         Chave     = paste(NASC, Sexo, CEP, Mun_Res),
+         Chave_sem_CEP = paste(NASC, Sexo, Mun_Res))
+
+resumo_intern <- intern %>%
+  summarise(Internacoes = n(), Pct_Feminino = round(mean(Sexo == "Feminino") * 100, 2),
+            Idade_Mediana = median(Idade), Pct_Menor_5 = round(mean(Idade < 5) * 100, 2),
+            Pct_J46 = round(mean(CID_Asma == "J46 Estado de mal asmático") * 100, 2),
+            Pct_Urgencia = round(mean(Carater == "Urgência") * 100, 2),
+            Permanencia_Mediana = median(Dias, na.rm = TRUE),
+            Permanencia_P75 = quantile(Dias, 0.75, na.rm = TRUE),
+            Pct_UTI = round(mean(UTI) * 100, 2),
+            Obitos = sum(Obito), Letalidade_Pct = round(mean(Obito) * 100, 3),
+            Pct_Fora_Municipio = round(mean(Fora_Municipio) * 100, 2))
+
+perfil_intern_faixa <- intern %>%
+  group_by(Faixa_Etaria) %>%
+  summarise(Internacoes = n(), Pct_Feminino = round(mean(Sexo == "Feminino") * 100, 2),
+            Permanencia_Mediana = median(Dias, na.rm = TRUE),
+            k_UTI = sum(UTI), Obitos = sum(Obito), .groups = "drop") %>%
+  mutate(Pct_UTI = round(k_UTI / Internacoes * 100, 2)) %>%
+  bind_cols(wilson_ci_pct(.$k_UTI, .$Internacoes) %>% round(2) %>%
+              rename(UTI_IC_Inf = IC_Inf_Pct, UTI_IC_Sup = IC_Sup_Pct)) %>%
+  select(-k_UTI)
+
+desfecho_hospitalar <- intern %>% count(Desfecho, name = "Internacoes") %>%
+  mutate(Pct = round(Internacoes / sum(Internacoes) * 100, 2))
+
+dist_intern <- bind_rows(lapply(c("Sexo", "Faixa_Etaria", "Raca_Cor", "CID_Asma", "Carater", "Local"),
+  function(v) intern %>% count(Categoria = as.character(.data[[v]])) %>%
+    mutate(Variavel = v, Pct = round(n / sum(n) * 100, 2), .before = 1)))
+
+# Série anual e taxas por 10 mil hab. de 0–19 anos (bruta e padronizada)
+intern_ano <- intern %>% group_by(Ano) %>%
+  summarise(Internacoes = n(), Pct_UTI = round(mean(UTI) * 100, 2),
+            Permanencia_Mediana = median(Dias, na.rm = TRUE), Obitos = sum(Obito), .groups = "drop")
+if (!is.null(pop_ped)) {
+  intern_ano <- intern_ano %>% left_join(pop_ano, by = "Ano") %>%
+    mutate(Taxa_Intern_10mil = round(Internacoes / Pop * 1e4, 2)) %>%
+    left_join(intern %>% filter(Faixa_Etaria %in% niveis_faixa) %>%
+                count(Ano, Faixa = as.character(Faixa_Etaria), name = "n") %>%
+                left_join(pop_faixa_ano, by = c("Ano", "Faixa")) %>%
+                left_join(pop_padrao, by = "Faixa") %>%
+                group_by(Ano) %>%
+                summarise(Taxa_Intern_Padronizada_10mil = round(sum(n / Pop * w) * 1e4, 2), .groups = "drop"),
+              by = "Ano")
+  taxa_intern_faixa <- intern %>% count(Ano, Faixa = as.character(Faixa_Etaria), name = "Internacoes") %>%
+    left_join(pop_faixa_ano, by = c("Ano", "Faixa")) %>%
+    mutate(Taxa_10mil = round(Internacoes / Pop * 1e4, 2))
+  apc_intern <- bind_rows(
+    apc_prais(intern_ano, "Taxa_Intern_10mil", "Internações / 10 mil", periodo_anos = anos),
+    apc_prais(intern_ano, "Taxa_Intern_10mil", "Internações / 10 mil", TRUE, periodo_anos = anos),
+    apc_prais(intern_ano, "Taxa_Intern_Padronizada_10mil", "Internações, padronizada por idade", periodo_anos = anos),
+    apc_prais(intern_ano, "Taxa_Intern_10mil", "Internações / 10 mil", periodo_anos = anos_tend))
+}
+
+# Concentração por hospital: mudanças na rede explicam parte da série
+concentracao_hosp <- intern %>% count(Ano, CNES) %>%
+  group_by(Ano) %>%
+  summarise(Internacoes = sum(n), Hospitais = n(),
+            Maior_Hospital = CNES[which.max(n)], Pct_Maior_Hospital = round(max(n) / sum(n) * 100, 1),
+            .groups = "drop") %>%
+  left_join(intern %>% group_by(Ano) %>% summarise(Pct_UTI = round(mean(UTI) * 100, 2)), by = "Ano")
+
+# Sazonalidade: média de internações por mês do calendário (exclui anos COVID)
+sazonalidade <- intern %>% filter(!Covid) %>%
+  mutate(Mes_Cal = as.integer(format(Data_Inter, "%m"))) %>%
+  count(Ano, Mes_Cal) %>%
+  complete(Ano, Mes_Cal = 1:12, fill = list(n = 0)) %>%
+  group_by(Mes_Cal) %>%
+  summarise(Media = round(mean(n), 2), DP = round(sd(n), 2), .groups = "drop") %>%
+  mutate(Indice_Sazonal = round(Media / mean(Media) * 100, 1))
+
+# Reinternação pela chave determinística
+reinternacao <- function(df, chave, rotulo) {
+  ep <- df %>%
+    transmute(Chave = .data[[chave]], Data_Inter, Data_Saida, Obito) %>%
+    filter(!is.na(Data_Inter), !is.na(Data_Saida)) %>%
+    arrange(Chave, Data_Inter) %>%
+    group_by(Chave) %>%
+    mutate(Saida_Max_Ant = lag(cummax(as.numeric(Data_Saida))),
+           Novo_Ep = is.na(Saida_Max_Ant) | as.numeric(Data_Inter) > Saida_Max_Ant + 1,
+           Ep = cumsum(Novo_Ep)) %>%
+    group_by(Chave, Ep) %>%
+    summarise(Ini = min(Data_Inter), Fim = max(Data_Saida), Obito = any(Obito), .groups = "drop") %>%
+    arrange(Chave, Ini) %>%
+    group_by(Chave) %>%
+    mutate(Prox_Ini = lead(Ini), Dias_Ate_Prox = as.numeric(Prox_Ini - Fim)) %>%
+    ungroup()
+  fim_obs <- max(df$Data_Saida, na.rm = TRUE)
+  idx <- ep %>% filter(!Obito, Fim <= fim_obs - 30)
+  idx12 <- ep %>% filter(!Obito, Fim <= fim_obs - 365)
+  pac <- ep %>% count(Chave, name = "Episodios")
+  r30 <- sum(!is.na(idx$Dias_Ate_Prox) & idx$Dias_Ate_Prox <= 30)
+  r365 <- sum(!is.na(idx12$Dias_Ate_Prox) & idx12$Dias_Ate_Prox <= 365)
+  tibble(Chave = rotulo, AIH = nrow(df), Episodios = nrow(ep), Criancas = nrow(pac),
+         Pct_Criancas_2mais_Episodios = round(mean(pac$Episodios >= 2) * 100, 2),
+         Reintern_30d_Pct = round(r30 / nrow(idx) * 100, 2),
+         Reintern_30d_IC_Inf = round(wilson_ci_pct(r30, nrow(idx))$IC_Inf_Pct, 2),
+         Reintern_30d_IC_Sup = round(wilson_ci_pct(r30, nrow(idx))$IC_Sup_Pct, 2),
+         Reintern_12m_Pct = round(r365 / nrow(idx12) * 100, 2),
+         Reintern_12m_IC_Inf = round(wilson_ci_pct(r365, nrow(idx12))$IC_Inf_Pct, 2),
+         Reintern_12m_IC_Sup = round(wilson_ci_pct(r365, nrow(idx12))$IC_Sup_Pct, 2))
+}
+reinternacoes <- bind_rows(
+  reinternacao(intern, "Chave", "Nascimento + sexo + CEP + município (principal)"),
+  reinternacao(intern, "Chave_sem_CEP", "Nascimento + sexo + município (limite superior)"))
+reintern_faixa <- bind_rows(lapply(niveis_faixa, function(f)
+  reinternacao(intern %>% filter(Faixa_Etaria == f), "Chave", f) %>% rename(Faixa_Etaria = Chave)))
+
+# ==============================================================================
 # 10. NÍVEL MUNICIPAL, REGIÕES DE SAÚDE E ANÁLISE ECOLÓGICA [8][16]
 # ==============================================================================
 pop_mun <- if (!is.null(pop_ped)) pop_ped %>% group_by(Municipio = CO_MUN) %>%
@@ -1270,7 +1498,8 @@ asma_mun <- atend %>%
             .groups = "drop") %>%
   full_join(pacientes %>% count(Municipio = Mun_Res, name = "Pacientes_BI"), by = "Municipio") %>%
   full_join(pacientes_am %>% count(Municipio = Mun_Res, name = "Pacientes_AM"), by = "Municipio") %>%
-  mutate(across(c(N_Atendimentos, Pacientes_BI, Pacientes_AM), ~ coalesce(.x, 0L)))
+  full_join(intern %>% count(Municipio = Mun_Res, name = "Internacoes"), by = "Municipio") %>%
+  mutate(across(c(N_Atendimentos, Pacientes_BI, Pacientes_AM, Internacoes), ~ coalesce(.x, 0L)))
 
 regioes <- tryCatch(brpop::mun_reg_saude_449 %>%
                       transmute(Municipio = substr(as.character(code_muni), 1, 6),
@@ -1280,7 +1509,8 @@ regioes <- tryCatch(brpop::mun_reg_saude_449 %>%
 if (!is.null(pop_mun)) {
   asma_mun <- asma_mun %>% left_join(pop_mun, by = "Municipio") %>%
     mutate(Taxa_Pac_BI_10mil_ano = round(Pacientes_BI / Pop_Anos * 1e4, 2),
-           Taxa_Pac_AM_10mil_ano = round(Pacientes_AM / Pop_Anos * 1e4, 2))
+           Taxa_Pac_AM_10mil_ano = round(Pacientes_AM / Pop_Anos * 1e4, 2),
+           Taxa_Intern_10mil_ano = round(Internacoes / Pop_Anos * 1e4, 2))
   # Maceió × interior: razão de taxas (quase-Poisson com offset) [8]
   rr_local <- function(var) {
     d <- asma_mun %>% filter(!is.na(Pop_Anos)) %>%
@@ -1292,9 +1522,29 @@ if (!is.null(pop_mun)) {
            IC_Inf = round(exp(cf[[1]] - 1.96 * cf[[2]]), 2),
            IC_Sup = round(exp(cf[[1]] + 1.96 * cf[[2]]), 2), P_Valor = signif(cf[[4]], 3))
   }
-  razao_taxas_local <- bind_rows(rr_local("Pacientes_BI"), rr_local("Pacientes_AM")) %>%
+  razao_taxas_local <- bind_rows(rr_local("Pacientes_BI"), rr_local("Pacientes_AM"),
+                                 rr_local("Internacoes")) %>%
     mutate(Desfecho = recode(Desfecho, Pacientes_BI = "Pacientes atendidos (BI) por habitante 0–19",
-                             Pacientes_AM = "Pacientes no CEAF por habitante 0–19"))
+                             Pacientes_AM = "Pacientes no CEAF por habitante 0–19",
+                             Internacoes = "Internações por asma por habitante 0–19"))
+  # Ecológico: municípios com mais crianças no CEAF / atendidas internam menos?
+  # Quase-Poisson com offset da população; RR por +1 paciente/10 mil hab.-ano.
+  d_eco_int <- asma_mun %>% filter(!is.na(Pop_Anos), Pop_Anos > 0)
+  m_int <- glm(Internacoes ~ Taxa_Pac_AM_10mil_ano + Taxa_Pac_BI_10mil_ano + offset(log(Pop_Anos)),
+               family = quasipoisson, data = d_eco_int)
+  cf_int <- coef(summary(m_int))[-1, , drop = FALSE]
+  sp_int <- cor.test(d_eco_int$Taxa_Pac_AM_10mil_ano, d_eco_int$Taxa_Intern_10mil_ano,
+                     method = "spearman", exact = FALSE)
+  eco_internacao <- bind_rows(
+    tibble(Analise = c("RR de internação por +1 paciente/10 mil no CEAF (ajustado por BI)",
+                       "RR de internação por +1 paciente/10 mil atendido no BI (ajustado por CEAF)"),
+           Estimativa = round(exp(cf_int[, 1]), 3),
+           IC_Inf = round(exp(cf_int[, 1] - 1.96 * cf_int[, 2]), 3),
+           IC_Sup = round(exp(cf_int[, 1] + 1.96 * cf_int[, 2]), 3),
+           P_Valor = signif(cf_int[, 4], 3)),
+    tibble(Analise = "Spearman: taxa CEAF × taxa de internação", Estimativa = round(sp_int$estimate, 3),
+           P_Valor = signif(sp_int$p.value, 3))) %>%
+    mutate(N_Municipios = nrow(d_eco_int))
   if (!is.null(regioes)) {
     taxas_regiao <- asma_mun %>% left_join(regioes, by = "Municipio") %>%
       filter(!is.na(Regiao_Saude)) %>%
@@ -1303,6 +1553,8 @@ if (!is.null(pop_mun)) {
                 Pacientes_BI = sum(Pacientes_BI), Pacientes_AM = sum(Pacientes_AM),
                 Taxa_Pac_BI_10mil_ano = round(sum(Pacientes_BI) / sum(Pop_Anos, na.rm = TRUE) * 1e4, 2),
                 Taxa_Pac_AM_10mil_ano = round(sum(Pacientes_AM) / sum(Pop_Anos, na.rm = TRUE) * 1e4, 2),
+                Internacoes = sum(Internacoes),
+                Taxa_Intern_10mil_ano = round(sum(Internacoes) / sum(Pop_Anos, na.rm = TRUE) * 1e4, 2),
                 .groups = "drop")
   }
 }
@@ -1325,7 +1577,9 @@ eco <- if (nrow(mun_eco) >= 5) {
 
 # Pacientes no CEAF por ano na tabela de tendência (+ taxa) e APC
 tendencia <- tendencia %>%
-  left_join(pacientes_am_ano %>% select(Ano, Pacientes_CEAF = Pacientes_Todas_APAC), by = "Ano")
+  left_join(pacientes_am_ano %>% select(Ano, Pacientes_CEAF = Pacientes_Todas_APAC), by = "Ano") %>%
+  left_join(intern_ano %>% select(Ano, Internacoes, any_of(c("Taxa_Intern_10mil", "Taxa_Intern_Padronizada_10mil"))),
+            by = "Ano")
 if (!is.null(pop_ped)) tendencia <- tendencia %>%
   mutate(Taxa_CEAF_10mil = round(Pacientes_CEAF / Pop * 1e4, 2))
 apc <- if (!is.null(pop_ped)) bind_rows(
@@ -1384,11 +1638,13 @@ p_urg_servico <- urgencia_servico %>%
        caption = fonte_bi, x = NULL, y = "% dos atendimentos com caráter de urgência", fill = NULL) + tema
 
 d_tend <- tendencia %>%
-  select(Ano, any_of(c("Taxa_Pacientes_10mil", "Taxa_Pac_Padronizada_10mil", "Taxa_CEAF_10mil"))) %>%
+  select(Ano, any_of(c("Taxa_Pacientes_10mil", "Taxa_Pac_Padronizada_10mil", "Taxa_CEAF_10mil",
+                       "Taxa_Intern_10mil"))) %>%
   pivot_longer(-Ano, names_to = "Serie", values_to = "Taxa") %>%
   mutate(Serie = recode(Serie, Taxa_Pacientes_10mil = "Pacientes atendidos (BI), bruta",
                         Taxa_Pac_Padronizada_10mil = "Pacientes atendidos (BI), padronizada por idade",
-                        Taxa_CEAF_10mil = "Pacientes em tratamento no CEAF"))
+                        Taxa_CEAF_10mil = "Pacientes em tratamento no CEAF",
+                        Taxa_Intern_10mil = "Internações por asma (SIH)"))
 p_tendencia <- ggplot(d_tend, aes(Ano, Taxa, color = Serie)) +
   annotate("rect", xmin = min(anos_covid) - 0.5, xmax = max(anos_covid) + 0.5, ymin = -Inf, ymax = Inf,
            alpha = 0.12, fill = "gray50") +
@@ -1396,11 +1652,14 @@ p_tendencia <- ggplot(d_tend, aes(Ano, Taxa, color = Serie)) +
   geom_vline(xintercept = min(anos_tend) - 0.5, linetype = "dashed", color = "gray40") +
   geom_line(linewidth = 1.1) + geom_point(size = 2) +
   scale_x_continuous(breaks = anos) +
-  scale_color_manual(values = c("#0072B2", "#56B4E9", "#009E73")) +
-  labs(title = "Pacientes de 0–19 anos com asma por 10 mil habitantes — Alagoas",
+  scale_color_manual(values = c("Pacientes atendidos (BI), bruta" = "#0072B2",
+                                "Pacientes atendidos (BI), padronizada por idade" = "#56B4E9",
+                                "Pacientes em tratamento no CEAF" = "#009E73",
+                                "Internações por asma (SIH)" = "#D55E00")) +
+  labs(title = "Asma em crianças e adolescentes (0–19 anos) por 10 mil habitantes — Alagoas",
        subtitle = sprintf("Linha tracejada: início da série estável (%d) | população %s repetida em 2025",
                           min(anos_tend), pop_ano_disponivel),
-       caption = "Fonte: SIASUS/DATASUS (BI e AM); população: estimativas DATASUS (brpop).",
+       caption = "Fonte: SIASUS e SIH/DATASUS; população: estimativas DATASUS (brpop).",
        x = NULL, y = "Por 10 mil hab. 0–19 anos", color = NULL) +
   guides(color = guide_legend(nrow = 2)) + tema
 
@@ -1474,7 +1733,7 @@ p_km <- km_curvas %>%
   coord_cartesian(xlim = c(0, 36)) +
   scale_color_brewer(palette = "Dark2") +
   labs(title = "Persistência no tratamento (Kaplan-Meier) — 0–19 anos",
-       subtitle = "Evento: ≥ 3 meses observáveis sem dispensação | censura: em uso, troca, 20 anos, óbito | apresentações com ≥ 20 episódios",
+       subtitle = "Evento: ≥ 3 meses observáveis sem dispensação | censura: em uso, troca, limite de idade, óbito | apresentações com ≥ 20 episódios",
        caption = fonte_am, x = "Meses desde o início do episódio", y = "% ainda em tratamento", color = NULL) +
   guides(color = guide_legend(nrow = 2)) + tema
 
@@ -1515,15 +1774,41 @@ p_antes_depois <- bind_rows(resumo_janelas, resumo_did %>% filter(Grupo == "Cont
        x = "Janela (meses em relação ao início)", y = "Urgências por paciente", color = NULL) + tema
 
 p_regiao <- if (exists("taxas_regiao")) taxas_regiao %>%
-  pivot_longer(c(Taxa_Pac_BI_10mil_ano, Taxa_Pac_AM_10mil_ano), names_to = "Serie", values_to = "Taxa") %>%
-  mutate(Serie = recode(Serie, Taxa_Pac_BI_10mil_ano = "Atendidos (BI)", Taxa_Pac_AM_10mil_ano = "Em tratamento (CEAF)")) %>%
+  pivot_longer(c(Taxa_Pac_BI_10mil_ano, Taxa_Pac_AM_10mil_ano, Taxa_Intern_10mil_ano),
+               names_to = "Serie", values_to = "Taxa") %>%
+  mutate(Serie = recode(Serie, Taxa_Pac_BI_10mil_ano = "Atendidos (BI)", Taxa_Pac_AM_10mil_ano = "Em tratamento (CEAF)",
+                        Taxa_Intern_10mil_ano = "Internações (SIH)")) %>%
   ggplot(aes(reorder(Regiao_Saude, Taxa), Taxa, fill = Serie)) +
   geom_col(position = position_dodge(0.8), width = 0.7) + coord_flip() +
-  scale_fill_manual(values = c("Atendidos (BI)" = "#0072B2", "Em tratamento (CEAF)" = "#009E73")) +
+  scale_fill_manual(values = c("Atendidos (BI)" = "#0072B2", "Em tratamento (CEAF)" = "#009E73",
+                               "Internações (SIH)" = "#D55E00")) +
   labs(title = "Pacientes de 0–19 anos com asma por região de saúde de residência",
        subtitle = paste0("Pacientes por 10 mil hab.-ano | ", periodo),
        caption = "Fonte: SIASUS/DATASUS; regiões e população: brpop.",
        x = "Região de saúde (código)", y = "Por 10 mil habitantes-ano", fill = NULL) + tema else NULL
+
+p_sazonal <- ggplot(sazonalidade, aes(Mes_Cal, Media)) +
+  geom_col(fill = "#D55E00", width = 0.7) +
+  geom_errorbar(aes(ymin = pmax(Media - DP, 0), ymax = Media + DP), width = 0.2, color = "gray30") +
+  scale_x_continuous(breaks = 1:12, labels = c("jan", "fev", "mar", "abr", "mai", "jun",
+                                               "jul", "ago", "set", "out", "nov", "dez")) +
+  labs(title = "Sazonalidade das internações por asma (0–19 anos) — Alagoas",
+       subtitle = "Média mensal de internações (± DP), excluindo 2020–2021",
+       caption = "Fonte: SIH/DATASUS (RD). CID principal J45/J46.",
+       x = NULL, y = "Internações por mês (média)") + tema
+
+p_eco_int <- if (exists("d_eco_int")) d_eco_int %>%
+  mutate(Local = if_else(Municipio == cod_maceio, "Maceió", "Interior")) %>%
+  ggplot(aes(Taxa_Pac_AM_10mil_ano, Taxa_Intern_10mil_ano)) +
+  geom_smooth(method = "loess", formula = y ~ x, se = TRUE, color = "gray40", linewidth = 0.8) +
+  geom_point(aes(size = Pop_Media, color = Local), alpha = 0.7) +
+  scale_color_manual(values = c("Maceió" = "#D55E00", "Interior" = "#0072B2")) +
+  scale_size_continuous(range = c(1.5, 9), guide = "none") +
+  labs(title = "Tratamento no CEAF × internação por asma, por município (0–19 anos)",
+       subtitle = "Cada ponto é um município (tamanho = população 0–19) | taxas por 10 mil hab.-ano",
+       caption = "Fonte: SIASUS (AM) e SIH/DATASUS. Associação ecológica: não vale para indivíduos.",
+       x = "Pacientes no CEAF por 10 mil hab.-ano", y = "Internações por 10 mil hab.-ano", color = NULL) +
+  tema else NULL
 
 # ==============================================================================
 # EXPORTAÇÃO
@@ -1542,7 +1827,9 @@ figuras <- list(
   "Asma_Ped_11_desfecho_medicamento"   = list(p_desfecho, 12, 7.5),
   "Asma_Ped_12_vinculo_urgencia_OR"    = list(p_vinculo, 11, 5),
   "Asma_Ped_13_antes_depois"           = list(p_antes_depois, 11, 6.5),
-  "Asma_Ped_14_regioes_saude"          = list(p_regiao, 11, 6.5))
+  "Asma_Ped_14_regioes_saude"          = list(p_regiao, 11, 6.5),
+  "Asma_Ped_15_internacoes_sazonalidade" = list(p_sazonal, 10, 5.5),
+  "Asma_Ped_16_CEAF_x_internacao_municipios" = list(p_eco_int, 10, 6.5))
 figuras <- Filter(function(f) !is.null(f[[1]]), figuras)
 arquivos_fig <- mapply(function(nome, f) salvar_grafico(f[[1]], nome, w = f[[2]], h = f[[3]]),
                        names(figuras), figuras)
@@ -1571,12 +1858,19 @@ resultados <- list(
   municipal = asma_mun,
   razao_taxas_local = if (exists("razao_taxas_local")) razao_taxas_local else NULL,
   taxas_regiao = if (exists("taxas_regiao")) taxas_regiao else NULL,
-  ecologico = eco, arquivos_falha = arquivos_falha)
+  ecologico = eco, arquivos_falha = arquivos_falha,
+  fluxo_sih = fluxo_sih, resumo_intern = resumo_intern, perfil_intern_faixa = perfil_intern_faixa,
+  desfecho_hospitalar = desfecho_hospitalar, dist_intern = dist_intern, intern_ano = intern_ano,
+  apc_intern = if (exists("apc_intern")) apc_intern else NULL, sazonalidade = sazonalidade,
+  reinternacoes = reinternacoes, reintern_faixa = reintern_faixa,
+  sih_asma_secundaria = sih_asma_secundaria, concentracao_hosp = concentracao_hosp,
+  eco_internacao = if (exists("eco_internacao")) eco_internacao else NULL)
 saveRDS(resultados, file.path(output_dir, "Asma_Ped_resultados.rds"))
 saveRDS(atend, file.path(output_dir, "Base_Asma_Ped_atendimentos.rds"))
 saveRDS(pacientes, file.path(output_dir, "Base_Asma_Ped_pacientes_BI.rds"))
 saveRDS(pacientes_am, file.path(output_dir, "Base_Asma_Ped_pacientes_AM.rds"))
 saveRDS(episodios, file.path(output_dir, "Base_Asma_Ped_episodios.rds"))
+saveRDS(intern, file.path(output_dir, "Base_Asma_Ped_internacoes.rds"))
 
 # ==============================================================================
 # RELATÓRIO DOCX
@@ -1599,10 +1893,9 @@ add_fig <- function(doc, nome) {
 doc <- read_docx() %>%
   body_add_par("Asma em crianças e adolescentes (0–19 anos) no SUS — Alagoas", style = "heading 1") %>%
   body_add_par(paste0(
-    "Atendimentos ambulatoriais (SIASUS, BPA-I) e tratamento no CEAF (APAC de medicamentos), ", periodo,
-    ". Versão revisada após auditoria metodológica (Auditoria_Asma_SIASUS.md). ",
-    "Idade medida na data de cada registro. Os dados descrevem a asma atendida na média complexidade ",
-    "e na urgência registradas no SIA: a atenção primária (SISAB) e as internações (SIH) não estão incluídas."),
+    "Atendimentos ambulatoriais (SIASUS, BPA-I), tratamento no CEAF (APAC de medicamentos) e ",
+    "internações (SIH), ", periodo, ". Versão revisada após auditoria metodológica (Auditoria_Asma_SIASUS.md). ",
+    "Idade medida na data de cada registro. A atenção primária (SISAB) não está incluída."),
     style = "Normal") %>%
 
   body_add_par("1. Seleção e qualidade", style = "heading 2") %>%
@@ -1670,7 +1963,9 @@ doc <- read_docx() %>%
   body_add_par(paste0(
     "O SIASUS não registra alta nem reinternação (estão no SIH, sem CNS nos arquivos públicos). ",
     "Episódio = paciente × medicamento; lacuna ≥ 3 meses observáveis abre novo episódio. ",
-    "Desfecho hierárquico: óbito > completou 20 anos e seguiu no CEAF adulto > troca > em uso no fim ",
+    sprintf("Entrada aos 0–%d anos; seguimento até %d anos (margem de %d ano para quem faz %d durante o tratamento). ",
+            idade_ped, idade_ped + margem_idade, margem_idade, idade_ped + 1),
+    "Desfecho hierárquico: óbito > atingiu o limite de idade e seguiu no CEAF > troca > em uso no fim ",
     "> saída registrada > interrompeu. 'Troca de cápsula' é troca de apresentação, não necessariamente de etapa."),
     style = "Normal") %>%
   add_tab(motivo_saida_am, "Motivo de saída registrado nas APAC") %>%
@@ -1678,7 +1973,7 @@ doc <- read_docx() %>%
             pivot_wider(names_from = Desfecho, values_from = Pct, values_fill = 0),
           "Desfecho por medicamento (% dos episódios)") %>%
   add_fig("Asma_Ped_11_desfecho_medicamento") %>%
-  add_tab(desfecho_sensibilidade, "Sensibilidade: todas as APAC × só aprovadas") %>%
+  add_tab(desfecho_sensibilidade, "Sensibilidade: todas as APAC × só aprovadas × sem margem de idade") %>%
   add_tab(persistencia_km, "Persistência (Kaplan-Meier)") %>%
   add_fig("Asma_Ped_10_persistencia_KM") %>%
 
@@ -1699,7 +1994,36 @@ doc <- read_docx() %>%
                  "urgência caiu MENOS nos casos que nos controles; não indica efeito do tratamento.")) %>%
   add_fig("Asma_Ped_13_antes_depois") %>%
 
-  body_add_par("8. Municípios e regiões de saúde", style = "heading 2") %>%
+  body_add_par("8. Internações por asma (SIH)", style = "heading 2") %>%
+  body_add_par(paste0(
+    "AIH com CID principal J45/J46 (asma é condição sensível à atenção primária, Portaria SAS 221/2008), ",
+    "ano da internação, residentes em AL internados em AL. AIH de continuação e reapresentações excluídas. ",
+    "Os arquivos públicos não têm CNS: reinternação estimada por chave determinística (data de nascimento, ",
+    "sexo, CEP e município); a chave sem CEP dá o limite superior. Não há ligação individual com BI/CEAF."),
+    style = "Normal") %>%
+  add_tab(fluxo_sih, "Fluxograma — SIH") %>%
+  add_tab(resumo_intern, "Resumo das internações") %>%
+  add_tab(perfil_intern_faixa, "Permanência, UTI e óbitos por faixa etária") %>%
+  add_tab(desfecho_hospitalar, "Desfecho da internação") %>%
+  add_tab(dist_intern, "Distribuições") %>%
+  add_tab(intern_ano, "Série anual") %>%
+  add_tab(concentracao_hosp, "Concentração por hospital",
+          paste0("Em 2015–2017 um único hospital concentrou 38–55% das internações, com UTI quase nula; ",
+                 "a saída dele da série em 2018 explica boa parte da queda das internações e da alta da ",
+                 "proporção de UTI. Interpretar a tendência com cautela.")) %>%
+  add_tab(if (exists("apc_intern")) apc_intern else NULL, "Variação percentual anual (Prais-Winsten)") %>%
+  add_tab(sazonalidade, "Sazonalidade (média por mês, sem 2020–2021)") %>%
+  add_fig("Asma_Ped_15_internacoes_sazonalidade") %>%
+  add_tab(reinternacoes, "Reinternação (chave determinística)",
+          "Episódio = AIH unidas quando a nova internação ocorre até 1 dia após a alta (transferência). Índice: alta viva com 30 dias (ou 12 meses) observáveis.") %>%
+  add_tab(reintern_faixa, "Reinternação por faixa etária (chave principal)") %>%
+  add_tab(sih_asma_secundaria, "AIH com asma só como diagnóstico secundário (capítulo do CID principal)") %>%
+  add_tab(if (exists("eco_internacao")) eco_internacao else NULL,
+          "Ecológico: tratamento no CEAF e atendimento ambulatorial × internação (municípios)",
+          "Quase-Poisson com offset da população 0–19. Associação entre municípios, não entre pacientes.") %>%
+  add_fig("Asma_Ped_16_CEAF_x_internacao_municipios") %>%
+
+  body_add_par("9. Municípios e regiões de saúde", style = "heading 2") %>%
   add_tab(if (exists("razao_taxas_local")) razao_taxas_local else NULL, "Maceió × interior (razão de taxas, quase-Poisson)") %>%
   add_tab(if (exists("taxas_regiao")) taxas_regiao else NULL, "Taxas por região de saúde") %>%
   add_fig("Asma_Ped_14_regioes_saude") %>%
@@ -1708,7 +2032,7 @@ doc <- read_docx() %>%
                   min_registros_mun)) %>%
   add_tab(asma_mun %>% arrange(desc(N_Atendimentos)), "Municípios") %>%
 
-  body_add_par("9. Reprodutibilidade", style = "heading 2") %>%
+  body_add_par("10. Reprodutibilidade", style = "heading 2") %>%
   add_tab(arquivos_falha, "Arquivos que falharam na leitura") %>%
   body_add_par(paste(capture.output(print(sessionInfo())), collapse = "\n"), style = "Normal")
 
