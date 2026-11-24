@@ -60,6 +60,7 @@ save_forest <- function(m, base) {
                            leftlabs  = c("Study","Mean change","SD change","N","Weight","SMC","95% CI"),
                            rightcols = FALSE,                      # forest à direita
                            colgap = "4mm", pooled.totals = TRUE, digits = 2,
+                           details = FALSE,                        # sem bloco "Details of meta-analysis methods" (meta >= 8)
                            col.square = "darkblue", col.square.lines = "darkblue",
                            col.diamond = "black", col.diamond.lines = "black",
                            col.predict = "red"), base)
@@ -71,6 +72,7 @@ save_loo <- function(m, base) {
                            leftcols  = c("studlab","effect","ci"),
                            leftlabs  = c("Study","SMC","95% CI"),
                            rightcols = FALSE, digits = 2,          # forest à direita
+                           details = FALSE,
                            col.square = "darkblue", col.bg = "darkblue", col.border = "darkblue",
                            col.diamond = "black", col.diamond.lines = "black"), base, altura = 5.0)
 }
