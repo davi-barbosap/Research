@@ -1,0 +1,4 @@
+# Dados em nível de paciente (CNS criptografado) e caches de extração: não versionar
+*.rds
+cache_asma_*/
+.DS_Store
