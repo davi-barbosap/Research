@@ -56,9 +56,9 @@ salvar <- function(draw, base, largura = 11, altura = 4.8, dpi = 300) {
 # 
 save_forest <- function(m, base) {
   salvar(function() forest(m,
-                           leftcols  = c("studlab","mean.e","sd.e","n.e","w.random"),
-                           leftlabs  = c("Study","Mean change","SD change","N","Weight"),
-                           rightcols = c("effect","ci"), rightlabs = c("SMC","95% CI"),
+                           leftcols  = c("studlab","mean.e","sd.e","n.e","w.random","effect","ci"),
+                           leftlabs  = c("Study","Mean change","SD change","N","Weight","SMC","95% CI"),
+                           rightcols = FALSE,                      # forest à direita
                            colgap = "4mm", pooled.totals = TRUE, digits = 2,
                            col.square = "darkblue", col.square.lines = "darkblue",
                            col.diamond = "black", col.diamond.lines = "black",
@@ -68,7 +68,9 @@ save_forest <- function(m, base) {
 # 
 save_loo <- function(m, base) {
   salvar(function() forest(metainf(m, pooled = "random"), prediction = FALSE,
-                           rightcols = c("effect","ci"), rightlabs = c("SMC","95% CI"), digits = 2,
+                           leftcols  = c("studlab","effect","ci"),
+                           leftlabs  = c("Study","SMC","95% CI"),
+                           rightcols = FALSE, digits = 2,          # forest à direita
                            col.square = "darkblue", col.bg = "darkblue", col.border = "darkblue",
                            col.diamond = "black", col.diamond.lines = "black"), base, altura = 5.0)
 }
